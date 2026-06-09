@@ -6,6 +6,7 @@ import { ethers } from 'ethers';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import fs from 'fs';
+import qrcode from 'qrcode';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import 'dotenv/config';
@@ -525,6 +526,7 @@ async function handleMessage(jid, text) {
 // ── WhatsApp connection ────────────────────────────────────────
 let waSocket    = null;
 let waConnected = false;
+let currentQr    = null;
 const pendingImages = new Map();
 
 async function sendWAMessage(jid, text) {
@@ -548,8 +550,13 @@ async function connectWhatsApp() {
   waSocket.ev.on('creds.update', saveCreds);
 
   waSocket.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      currentQr = qr;
+      console.log('📱 QR code ready — visit /qr to scan');
+    }
     if (connection === 'open') {
       waConnected = true;
+      currentQr = null;
       console.log('✅ SAGE connected to WhatsApp');
       setInterval(monitorIncomingTransfers, 30000);
     }
@@ -607,6 +614,13 @@ app.use(express.static(path.join(__dirname, 'ui')));
 
 // ── HTTP endpoints ────────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ ok: true, connected: waConnected }));
+
+app.get('/qr', async (req, res) => {
+  if (waConnected) return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>✅ SAGE is already connected to WhatsApp</h2></body></html>');
+  if (!currentQr)  return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column"><h2>⏳ Waiting for QR code...</h2><p>Refresh in a few seconds</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>');
+  const dataUrl = await qrcode.toDataURL(currentQr, { width: 300, margin: 2 });
+  res.send(`<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0"><h2>Scan with WhatsApp</h2><img src="${dataUrl}" style="border-radius:12px"/><p style="opacity:0.6;font-size:13px">Auto-refreshes every 30s</p><script>setTimeout(()=>location.reload(),30000)</script></body></html>`);
+});
 
 app.get('/wallet/:jid', async (req, res) => {
   try {
