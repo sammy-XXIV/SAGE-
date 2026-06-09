@@ -485,13 +485,21 @@ TRADING STOCKS:
 
 // ── Claude message handler ────────────────────────────────────
 async function handleMessage(jid, text) {
+  // Auto-create wallet on first interaction and inject address into context
+  const walletRow = await getOrCreateWallet(jid);
+  const isFirstMessage = getHistory(jid).length === 0;
+
   addToHistory(jid, 'user', text);
   const history = getHistory(jid);
+
+  const dynamicSystem = SYSTEM_PROMPT +
+    `\n\nThis user's wallet address is: ${walletRow.address}` +
+    (isFirstMessage ? `\n\nThis is their FIRST message. Greet them, tell them their wallet has been set up, show their address, and tell them to fund it with testnet ETH from https://faucet.testnet.chain.robinhood.com/ to start trading.` : '');
 
   let response = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
     max_tokens: 1024,
-    system:     SYSTEM_PROMPT,
+    system:     dynamicSystem,
     tools:      sageTools,
     messages:   history,
   });
@@ -511,7 +519,7 @@ async function handleMessage(jid, text) {
     response = await anthropic.messages.create({
       model:      'claude-haiku-4-5-20251001',
       max_tokens: 1024,
-      system:     SYSTEM_PROMPT,
+      system:     dynamicSystem,
       tools:      sageTools,
       messages:   getHistory(jid),
     });
