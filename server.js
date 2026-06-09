@@ -220,21 +220,20 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
 
 // ── Stock price lookup (Yahoo Finance unofficial) ──────────────
 const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', AMD: 'AMD' };
-const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
+// Fetch price directly from on-chain DEX reserves — no external API needed
 async function getStockPrice(symbol) {
   try {
     const s = symbol.toUpperCase();
-    const [quoteRes, prevRes] = await Promise.all([
-      fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`),
-      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${s}&resolution=D&count=2&token=${FINNHUB_KEY}`),
-    ]);
-    const q = await quoteRes.json();
-    if (!q?.c || q.c === 0) return null;
-    const price  = q.c;
-    const prev   = q.pc;
-    const change = prev ? ((price - prev) / prev * 100) : 0;
-    return { price, change: change.toFixed(2), symbol: s };
+    if (!DEX) throw new Error('DEX not loaded');
+    const stockAddr = TOKENS[s]?.address;
+    const usdgAddr  = TOKENS['USDG']?.address;
+    if (!stockAddr || stockAddr === 'native') throw new Error(`Unknown token: ${s}`);
+
+    const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
+    const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [stockAddr, usdgAddr]);
+    const price   = parseFloat(ethers.formatUnits(amounts[1], 6)); // USDG = 6 decimals
+    return { price, change: '0.00', symbol: s };
   } catch (e) {
     console.error(`[Price] ${symbol} error:`, e.message);
     return null;
@@ -836,9 +835,8 @@ app.get('/prices', async (req, res) => {
   const result = {};
   await Promise.all(syms.map(async sym => {
     try {
-      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
-      const q = await r.json();
-      result[sym] = q?.c ? { price: q.c, prev: q.pc } : null;
+      const data = await getStockPrice(sym);
+      result[sym] = data ? { price: data.price, prev: data.price } : null;
     } catch {
       result[sym] = null;
     }
