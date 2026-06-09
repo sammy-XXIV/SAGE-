@@ -220,17 +220,23 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
 
 // ── Stock price lookup (Yahoo Finance unofficial) ──────────────
 const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', AMD: 'AMD' };
+const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
 async function getStockPrice(symbol) {
   try {
-    const s    = symbol.toUpperCase();
-    const q    = await yahooFinance.quote(s);
-    const price  = q?.regularMarketPrice;
-    const prev   = q?.regularMarketPreviousClose;
-    if (!price) return null;
+    const s = symbol.toUpperCase();
+    const [quoteRes, prevRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`),
+      fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${s}&resolution=D&count=2&token=${FINNHUB_KEY}`),
+    ]);
+    const q = await quoteRes.json();
+    if (!q?.c || q.c === 0) return null;
+    const price  = q.c;
+    const prev   = q.pc;
     const change = prev ? ((price - prev) / prev * 100) : 0;
     return { price, change: change.toFixed(2), symbol: s };
-  } catch {
+  } catch (e) {
+    console.error(`[Price] ${symbol} error:`, e.message);
     return null;
   }
 }
@@ -830,8 +836,9 @@ app.get('/prices', async (req, res) => {
   const result = {};
   await Promise.all(syms.map(async sym => {
     try {
-      const q = await yahooFinance.quote(sym);
-      result[sym] = { price: q?.regularMarketPrice, prev: q?.regularMarketPreviousClose };
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+      const q = await r.json();
+      result[sym] = q?.c ? { price: q.c, prev: q.pc } : null;
     } catch {
       result[sym] = null;
     }
