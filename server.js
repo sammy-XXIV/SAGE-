@@ -83,7 +83,7 @@ async function getOrCreateWallet(jid) {
   const { data } = await supabase
     .from('rh_wallets')
     .select('*')
-    .eq('user_jid', jid)
+    .eq('jid', jid)
     .single();
 
   if (data) {
@@ -96,7 +96,7 @@ async function getOrCreateWallet(jid) {
 
   const { data: inserted, error } = await supabase
     .from('rh_wallets')
-    .insert({ user_jid: jid, address: wallet.address, encrypted_pk: encrypted })
+    .insert({ jid, address: wallet.address, encrypted_pk: encrypted })
     .select()
     .single();
 
@@ -424,6 +424,7 @@ async function executeTool(name, input, jid) {
 
     return { error: 'Unknown tool' };
   } catch (e) {
+    console.error(`Tool error [${name}]:`, e.message);
     return { error: e.message };
   }
 }
