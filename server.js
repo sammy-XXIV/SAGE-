@@ -849,7 +849,88 @@ app.get('/prices', async (req, res) => {
   res.json(result);
 });
 
+// ── Price keeper (runs in-process every 60s) ──────────────────
+const KEEPER_THRESHOLD = 0.015;
+const KEEPER_PK = process.env.DEPLOYER_PRIVATE_KEY;
+
+const KEEPER_ROUTER_ABI = [
+  'function swapExactTokensForTokens(uint,uint,address[],address,uint) returns (uint[])',
+  'function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory)',
+];
+const KEEPER_ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function approve(address,uint256) returns (bool)',
+  'function allowance(address,address) view returns (uint256)',
+];
+const PAIR_ABI_KEEPER = [
+  'function getReserves() view returns (uint112,uint112,uint32)',
+  'function token0() view returns (address)',
+];
+
+async function keeperGetDexPrice(sym) {
+  if (!DEX) return null;
+  const dep = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8'));
+  const pair = new ethers.Contract(dep.pairs[sym], PAIR_ABI_KEEPER, provider);
+  const [r0, r1] = await pair.getReserves();
+  const token0   = await pair.token0();
+  const isUsdg0  = token0.toLowerCase() === TOKENS.USDG.address.toLowerCase();
+  const rUSDG    = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
+  const rSTOCK   = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
+  return { price: rUSDG / rSTOCK, rUSDG, rSTOCK };
+}
+
+async function runPriceKeeper() {
+  if (!KEEPER_PK || !DEX) return;
+  const keeper = new ethers.Wallet(KEEPER_PK, provider);
+  const dep    = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8'));
+  const router = new ethers.Contract(DEX.router, KEEPER_ROUTER_ABI, keeper);
+
+  for (const sym of ['TSLA', 'AMZN', 'PLTR', 'NFLX', 'AMD']) {
+    try {
+      const [market, dex] = await Promise.all([getStockPrice(sym), keeperGetDexPrice(sym)]);
+      if (!market || !dex) continue;
+
+      const deviation = Math.abs(dex.price - market.price) / market.price;
+      console.log(`[Keeper] ${sym} market=$${market.price.toFixed(2)} dex=$${dex.price.toFixed(2)} dev=${(deviation*100).toFixed(2)}%`);
+      if (deviation <= KEEPER_THRESHOLD) continue;
+
+      const k          = dex.rUSDG * dex.rSTOCK;
+      const rUSDG_new  = Math.sqrt(k * market.price);
+      const rSTOCK_new = Math.sqrt(k / market.price);
+      const deltaUSDG  = rUSDG_new - dex.rUSDG;
+
+      let tokenIn, tokenOut, amountIn, decimalsIn;
+      if (deltaUSDG > 0) {
+        tokenIn = TOKENS.USDG; tokenOut = TOKENS[sym]; amountIn = Math.min(deltaUSDG / 0.997, 20); decimalsIn = 6;
+      } else {
+        tokenIn = TOKENS[sym]; tokenOut = TOKENS.USDG; amountIn = Math.min(Math.abs(rSTOCK_new - dex.rSTOCK) / 0.997, 0.5); decimalsIn = 18;
+      }
+      if (amountIn < 0.000001) continue;
+
+      const erc20   = new ethers.Contract(tokenIn.address, KEEPER_ERC20_ABI, keeper);
+      const parsed  = ethers.parseUnits(amountIn.toFixed(decimalsIn), decimalsIn);
+      const bal     = await erc20.balanceOf(keeper.address);
+      if (bal < parsed) { console.log(`[Keeper] ${sym}: insufficient balance`); continue; }
+
+      const allowance = await erc20.allowance(keeper.address, DEX.router);
+      if (allowance < parsed) await (await erc20.approve(DEX.router, parsed)).wait();
+
+      const tx = await router.swapExactTokensForTokens(parsed, 0, [tokenIn.address, tokenOut.address], keeper.address, Math.floor(Date.now()/1000)+120);
+      await tx.wait();
+      console.log(`[Keeper] ${sym} rebalanced — ${tx.hash.slice(0,18)}…`);
+    } catch (e) {
+      console.error(`[Keeper] ${sym} error:`, e.message);
+    }
+  }
+}
+
 // ── Start ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`SAGE-RH running on port ${PORT}`));
 connectWhatsApp();
+
+// Start price keeper after 10s delay, then every 60s
+setTimeout(() => {
+  runPriceKeeper();
+  setInterval(runPriceKeeper, 60_000);
+}, 10_000);
