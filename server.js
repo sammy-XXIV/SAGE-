@@ -610,23 +610,27 @@ async function handleMessage(jid, text) {
 // ── Supabase-backed Baileys auth state ────────────────────────
 async function useSupabaseAuthState() {
   async function read(keyId) {
-    const { data } = await supabase.from('wa_sessions').select('data').eq('key_id', keyId).single();
+    const { data, error } = await supabase.from('wa_sessions').select('data').eq('key_id', keyId).single();
+    if (error && error.code !== 'PGRST116') console.error('[WA-AUTH] read error:', error.message);
     if (!data) return null;
     return JSON.parse(data.data, BufferJSON.reviver);
   }
 
   async function write(keyId, value) {
-    await supabase.from('wa_sessions').upsert(
+    const { error } = await supabase.from('wa_sessions').upsert(
       { key_id: keyId, data: JSON.stringify(value, BufferJSON.replacer), updated_at: new Date().toISOString() },
       { onConflict: 'key_id' }
     );
+    if (error) console.error('[WA-AUTH] write error:', error.message);
   }
 
   async function remove(keyId) {
-    await supabase.from('wa_sessions').delete().eq('key_id', keyId);
+    const { error } = await supabase.from('wa_sessions').delete().eq('key_id', keyId);
+    if (error) console.error('[WA-AUTH] remove error:', error.message);
   }
 
   const creds = (await read('creds')) || initAuthCreds();
+  console.log('[WA-AUTH] Loaded creds from Supabase:', creds ? 'existing session' : 'fresh start');
 
   return {
     state: {
