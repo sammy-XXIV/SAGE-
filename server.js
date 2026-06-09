@@ -208,10 +208,19 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
   const tx = await router.swapExactTokensForTokens(amtIn, amtOutMin, path, signer.address, deadline);
   const receipt = await tx.wait();
 
+  // Parse actual amountOut from the last Transfer log
+  const actualAmountOut = (() => {
+    try {
+      const transferTopic = ethers.id('Transfer(address,address,uint256)');
+      const last = [...receipt.logs].reverse().find(l => l.topics[0] === transferTopic);
+      return last ? parseFloat(ethers.formatUnits(last.data, toToken.decimals)) : parseFloat(minAmountOut);
+    } catch { return parseFloat(minAmountOut); }
+  })();
+
   // Log trade for PNL tracking
   const from = fromSymbol.toUpperCase();
   const to   = toSymbol.toUpperCase();
-  const isSwapFromUsdg = from === 'USDG'; // buying stock
+  const isSwapFromUsdg = from === 'USDG';
   const stockSym  = isSwapFromUsdg ? to : from;
   const priceData = await getStockPrice(stockSym);
   const priceUsdg = priceData?.price || 0;
@@ -220,7 +229,7 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
     symbol:     stockSym,
     side:       isSwapFromUsdg ? 'buy' : 'sell',
     amount_in:  parseFloat(amountIn),
-    amount_out: parseFloat(minAmountOut),
+    amount_out: actualAmountOut,
     price_usdg: priceUsdg,
     tx_hash:    tx.hash,
   });
@@ -232,6 +241,7 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
     fromSymbol: from,
     toSymbol:   to,
     amountIn:   parseFloat(amountIn),
+    amountOut:  actualAmountOut,
   };
 }
 
