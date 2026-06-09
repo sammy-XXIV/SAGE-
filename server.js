@@ -221,22 +221,19 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
 // ── Stock price lookup (Yahoo Finance unofficial) ──────────────
 const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', AMD: 'AMD' };
 
+const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
+
 async function getStockPrice(symbol) {
   const s = symbol.toUpperCase();
   try {
-    const res = await fetch(
-      `https://query2.finance.yahoo.com/v8/finance/chart/${s}?interval=1d&range=1d`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json' } }
-    );
-    const data  = await res.json();
-    const meta  = data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice;
-    const prev  = meta?.chartPreviousClose || meta?.previousClose;
-    if (!price) throw new Error('no price in response');
-    const change = prev ? ((price - prev) / prev * 100) : 0;
-    return { price, change: change.toFixed(2), symbol: s };
+    if (!FINNHUB_KEY) throw new Error('no key');
+    const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`);
+    const q   = await res.json();
+    if (!q?.c || q.c === 0) throw new Error('empty response');
+    const change = q.pc ? ((q.c - q.pc) / q.pc * 100) : 0;
+    return { price: q.c, change: change.toFixed(2), symbol: s };
   } catch (e) {
-    console.error(`[Price] ${s} Yahoo failed (${e.message}), falling back to on-chain`);
+    console.error(`[Price] ${s} Finnhub failed (${e.message}), falling back to on-chain`);
     try {
       if (!DEX) return null;
       const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);

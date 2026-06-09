@@ -44,16 +44,14 @@ const provider = new ethers.JsonRpcProvider(
 const keeper = new ethers.Wallet(process.env.DEPLOYER_PRIVATE_KEY, provider);
 const router = new ethers.Contract(ROUTER, ROUTER_ABI, keeper);
 
-// ── Fetch real price from Yahoo Finance ────────────────────────
+// ── Fetch real price from Finnhub ─────────────────────────────
 async function getMarketPrice(sym) {
-  const res = await fetch(
-    `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`,
-    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "application/json" } }
-  );
-  const data = await res.json();
-  const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
-  if (!price) throw new Error(`No price for ${sym}`);
-  return price;
+  const key = process.env.FINNHUB_API_KEY;
+  if (!key) throw new Error('FINNHUB_API_KEY not set');
+  const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
+  const q   = await res.json();
+  if (!q?.c || q.c === 0) throw new Error(`No price for ${sym}`);
+  return q.c;
 }
 
 // ── Get current DEX price from reserves ────────────────────────
