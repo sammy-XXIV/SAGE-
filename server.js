@@ -208,13 +208,30 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
   const tx = await router.swapExactTokensForTokens(amtIn, amtOutMin, path, signer.address, deadline);
   const receipt = await tx.wait();
 
+  // Log trade for PNL tracking
+  const from = fromSymbol.toUpperCase();
+  const to   = toSymbol.toUpperCase();
+  const isSwapFromUsdg = from === 'USDG'; // buying stock
+  const stockSym  = isSwapFromUsdg ? to : from;
+  const priceData = await getStockPrice(stockSym);
+  const priceUsdg = priceData?.price || 0;
+  await supabase.from('rh_trades').insert({
+    jid,
+    symbol:     stockSym,
+    side:       isSwapFromUsdg ? 'buy' : 'sell',
+    amount_in:  parseFloat(amountIn),
+    amount_out: parseFloat(minAmountOut),
+    price_usdg: priceUsdg,
+    tx_hash:    tx.hash,
+  });
+
   return {
     success: true,
     hash: tx.hash,
     explorer: `https://explorer.testnet.chain.robinhood.com/tx/${tx.hash}`,
-    fromSymbol: fromSymbol.toUpperCase(),
-    toSymbol: toSymbol.toUpperCase(),
-    amountIn: parseFloat(amountIn),
+    fromSymbol: from,
+    toSymbol:   to,
+    amountIn:   parseFloat(amountIn),
   };
 }
 
@@ -414,7 +431,28 @@ async function executeTool(name, input, jid) {
       const row      = await getOrCreateWallet(jid);
       const holdings = await getPortfolio(row.address);
       if (!holdings.length) return { holdings: [], message: 'Wallet is empty. Get testnet ETH from https://faucet.testnet.chain.robinhood.com/' };
-      return { address: row.address, holdings };
+
+      // Enrich with PNL for stock holdings
+      const { data: trades } = await supabase.from('rh_trades').select('*').eq('jid', jid);
+      const enriched = await Promise.all(holdings.map(async h => {
+        if (!STOCK_SYMBOLS[h.symbol]) return h;
+        const currentPrice = (await getStockPrice(h.symbol))?.price || 0;
+
+        // Calculate average cost basis from trades
+        let totalCost = 0, totalBought = 0, totalSold = 0;
+        (trades || []).filter(t => t.symbol === h.symbol).forEach(t => {
+          if (t.side === 'buy')  { totalCost += t.amount_in; totalBought += t.amount_out; }
+          if (t.side === 'sell') { totalSold += t.amount_in; }
+        });
+        const netHeld = totalBought - totalSold;
+        const avgCost = netHeld > 0 ? totalCost / netHeld : 0;
+        const pnlPct  = avgCost > 0 ? ((currentPrice - avgCost) / avgCost * 100).toFixed(2) : null;
+        const pnlUsdg = avgCost > 0 ? ((currentPrice - avgCost) * h.amount).toFixed(2) : null;
+
+        return { ...h, currentPrice, avgCost: avgCost.toFixed(2), pnlPct, pnlUsdg };
+      }));
+
+      return { address: row.address, holdings: enriched };
     }
 
     if (name === 'get_stock_price') {
