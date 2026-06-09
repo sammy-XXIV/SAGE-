@@ -288,7 +288,7 @@ const pendingExportJid   = new Map();
 
 async function getHistory(jid) {
   if (historyCache.has(jid)) return historyCache.get(jid);
-  const { data } = await supabase.from('conversation_history').select('messages').eq('jid', jid).single();
+  const { data } = await supabase.from('rh_conversation_history').select('messages').eq('jid', jid).single();
   const msgs = data?.messages || [];
   historyCache.set(jid, msgs);
   return msgs;
@@ -298,7 +298,7 @@ async function addToHistory(jid, role, content) {
   const h = await getHistory(jid);
   h.push({ role, content });
   if (h.length > 20) h.splice(0, h.length - 20);
-  await supabase.from('conversation_history').upsert(
+  await supabase.from('rh_conversation_history').upsert(
     { jid, messages: h, updated_at: new Date().toISOString() },
     { onConflict: 'jid' }
   );
