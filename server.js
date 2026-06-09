@@ -226,23 +226,14 @@ const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 async function getStockPrice(symbol) {
   const s = symbol.toUpperCase();
   try {
-    if (!FINNHUB_KEY) throw new Error('no key');
-    const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`);
-    const q   = await res.json();
-    if (!q?.c || q.c === 0) throw new Error('empty response');
-    const change = q.pc ? ((q.c - q.pc) / q.pc * 100) : 0;
-    return { price: q.c, change: change.toFixed(2), symbol: s };
+    if (!DEX) throw new Error('DEX not loaded');
+    const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
+    const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [TOKENS[s].address, TOKENS.USDG.address]);
+    const price   = parseFloat(ethers.formatUnits(amounts[1], 6));
+    return { price, change: '0.00', symbol: s };
   } catch (e) {
-    console.error(`[Price] ${s} Finnhub failed (${e.message}), falling back to on-chain`);
-    try {
-      if (!DEX) return null;
-      const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
-      const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [TOKENS[s].address, TOKENS.USDG.address]);
-      const price   = parseFloat(ethers.formatUnits(amounts[1], 6));
-      return { price, change: '0.00', symbol: s };
-    } catch {
-      return null;
-    }
+    console.error(`[Price] ${s} error:`, e.message);
+    return null;
   }
 }
 
