@@ -287,7 +287,8 @@ async function monitorIncomingTransfers() {
 
 // ── Conversation history ───────────────────────────────────────
 const conversationHistory = new Map();
-const onboardingState    = new Map(); // jid -> 'awaiting_choice' | 'awaiting_pk' | 'done'
+const onboardingState    = new Map(); // jid -> 'awaiting_choice' | 'awaiting_pk' | 'awaiting_password_set' | 'awaiting_export_password' | 'done'
+const pendingExportJid   = new Map(); // jid -> true (waiting for password to export)
 
 function getHistory(jid) {
   if (!conversationHistory.has(jid)) conversationHistory.set(jid, []);
@@ -482,7 +483,11 @@ TRADING STOCKS:
 - Only call execute_swap after explicit confirmation
 - After swap: show tx hash + explorer link + what they received
 - Swaps go through the SAGE DEX — a Uniswap V2 AMM deployed on Robinhood Chain
-- Supported pairs: USDG/TSLA, USDG/AMZN, USDG/PLTR, USDG/NFLX, USDG/AMD`;
+- Supported pairs: USDG/TSLA, USDG/AMZN, USDG/PLTR, USDG/NFLX, USDG/AMD
+
+EXPORTING PRIVATE KEY:
+- If the user asks to export or see their private key, reply EXACTLY with: __TRIGGER_EXPORT__
+- Do not say anything else, do not explain — just that token`;
 
 // ── Claude message handler ────────────────────────────────────
 async function handleMessage(jid, text) {
@@ -509,11 +514,11 @@ async function handleMessage(jid, text) {
       const encrypted_pk = encrypt(wallet.privateKey);
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
-      onboardingState.set(jid, 'done');
-      return `✅ *Wallet created!*\n\n📬 Address:\n\`${wallet.address}\`\n\nFund it with testnet ETH to start trading:\nhttps://faucet.testnet.chain.robinhood.com/\n\nOnce funded, just say *"buy $10 of TSLA"* or *"show my portfolio"* 🚀`;
+      onboardingState.set(jid, 'awaiting_password_set');
+      return `✅ *Wallet created!*\n\n📬 Address:\n\`${wallet.address}\`\n\nNow set a *password* to protect your wallet.\nYou'll need it to export your private key.\n\nReply with your chosen password:`;
     } else if (choice === '2') {
       onboardingState.set(jid, 'awaiting_pk');
-      return `🔑 Send your *private key* and I'll import your wallet.\n\n⚠️ It will be encrypted and stored securely. Never share it with anyone else.`;
+      return `🔑 Send your *private key* and I'll import your wallet.\n\n⚠️ It will be encrypted and stored securely. This message will be deleted immediately.`;
     } else {
       return `Please reply *1* to generate a new wallet or *2* to import an existing one.`;
     }
@@ -527,11 +532,35 @@ async function handleMessage(jid, text) {
       const encrypted_pk = encrypt(wallet.privateKey);
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
-      onboardingState.set(jid, 'done');
-      return `✅ *Wallet imported!*\n\n📬 Address:\n\`${wallet.address}\`\n\nJust say *"show my portfolio"* or *"buy $10 of TSLA"* to get started 🚀`;
+      onboardingState.set(jid, 'awaiting_password_set');
+      return `✅ *Wallet imported!*\n\n📬 Address:\n\`${wallet.address}\`\n\nNow set a *password* to protect your wallet.\nYou'll need it to export your private key.\n\nReply with your chosen password:`;
     } catch {
       return `❌ Invalid private key. Please try again or reply *1* to generate a new wallet instead.`;
     }
+  }
+
+  // ── Onboarding: set password ──────────────────────────────────
+  if (state === 'awaiting_password_set') {
+    const password = text.trim();
+    if (password.length < 6) return `❌ Password too short. Use at least 6 characters.`;
+    const password_hash = crypto.createHash('sha256').update(password).digest('hex');
+    await supabase.from('rh_wallets').update({ password_hash }).eq('jid', jid);
+    onboardingState.set(jid, 'done');
+    return `🔒 *Password set!*\n\nYour wallet is ready. Fund it with testnet ETH:\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to get started 🚀`;
+  }
+
+  // ── Export private key: waiting for password ──────────────────
+  if (state === 'awaiting_export_password') {
+    const { data: row } = await supabase.from('rh_wallets').select('encrypted_pk, password_hash').eq('jid', jid).single();
+    const entered_hash = crypto.createHash('sha256').update(text.trim()).digest('hex');
+    if (entered_hash !== row.password_hash) {
+      onboardingState.set(jid, 'done');
+      return `❌ Wrong password. Export cancelled.`;
+    }
+    const pk = decrypt(row.encrypted_pk);
+    onboardingState.set(jid, 'done');
+    // Return special marker — message handler will send + schedule deletion
+    return `__EXPORT_PK__${pk}`;
   }
 
   // ── Normal AI flow (onboarding done) ─────────────────────────
@@ -640,15 +669,46 @@ async function connectWhatsApp() {
       if (!text.trim()) continue;
 
       try {
+        const currentState = onboardingState.get(jid);
+        const isPkMessage     = currentState === 'awaiting_pk';
+        const isPasswordMsg   = currentState === 'awaiting_export_password';
+
         await waSocket.sendPresenceUpdate('composing', jid);
         const reply = await handleMessage(jid, text.trim());
         await waSocket.sendPresenceUpdate('paused', jid);
+
+        // Delete user's private key message immediately from both sides
+        if (isPkMessage) {
+          await waSocket.sendMessage(jid, { delete: msg.key });
+        }
+
+        // Delete user's export-password message immediately from both sides
+        if (isPasswordMsg) {
+          await waSocket.sendMessage(jid, { delete: msg.key });
+        }
+
+        // Handle private key export — send PK then delete after 2 minutes
+        if (reply.startsWith('__EXPORT_PK__')) {
+          const pk = reply.replace('__EXPORT_PK__', '');
+          const sent = await waSocket.sendMessage(jid, { text: `🔑 *Your Private Key*\n\n\`${pk}\`\n\n⚠️ Copy it now. This message will self-destruct in 2 minutes.` });
+          setTimeout(async () => {
+            try { await waSocket.sendMessage(jid, { delete: sent.key }); } catch {}
+          }, 2 * 60 * 1000);
+          continue;
+        }
 
         // Check if there's a pending image to send first
         if (pendingImages.has(jid)) {
           const { buffer, caption } = pendingImages.get(jid);
           pendingImages.delete(jid);
           await waSocket.sendMessage(jid, { image: buffer, caption });
+        }
+
+        // Claude triggered export flow
+        if (reply.trim() === '__TRIGGER_EXPORT__') {
+          onboardingState.set(jid, 'awaiting_export_password');
+          await waSocket.sendMessage(jid, { text: `🔒 Enter your *password* to export your private key:` });
+          continue;
         }
 
         await waSocket.sendMessage(jid, { text: reply });
