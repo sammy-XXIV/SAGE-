@@ -47,8 +47,8 @@ const router = new ethers.Contract(ROUTER, ROUTER_ABI, keeper);
 // ── Fetch real price from Yahoo Finance ────────────────────────
 async function getMarketPrice(sym) {
   const res = await fetch(
-    `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`,
-    { headers: { "User-Agent": "Mozilla/5.0" } }
+    `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`,
+    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "application/json" } }
   );
   const data = await res.json();
   const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;

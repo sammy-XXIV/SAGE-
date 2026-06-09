@@ -221,22 +221,31 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
 // ── Stock price lookup (Yahoo Finance unofficial) ──────────────
 const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', AMD: 'AMD' };
 
-// Fetch price directly from on-chain DEX reserves — no external API needed
 async function getStockPrice(symbol) {
+  const s = symbol.toUpperCase();
   try {
-    const s = symbol.toUpperCase();
-    if (!DEX) throw new Error('DEX not loaded');
-    const stockAddr = TOKENS[s]?.address;
-    const usdgAddr  = TOKENS['USDG']?.address;
-    if (!stockAddr || stockAddr === 'native') throw new Error(`Unknown token: ${s}`);
-
-    const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
-    const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [stockAddr, usdgAddr]);
-    const price   = parseFloat(ethers.formatUnits(amounts[1], 6)); // USDG = 6 decimals
-    return { price, change: '0.00', symbol: s };
+    const res = await fetch(
+      `https://query2.finance.yahoo.com/v8/finance/chart/${s}?interval=1d&range=1d`,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json' } }
+    );
+    const data  = await res.json();
+    const meta  = data?.chart?.result?.[0]?.meta;
+    const price = meta?.regularMarketPrice;
+    const prev  = meta?.chartPreviousClose || meta?.previousClose;
+    if (!price) throw new Error('no price in response');
+    const change = prev ? ((price - prev) / prev * 100) : 0;
+    return { price, change: change.toFixed(2), symbol: s };
   } catch (e) {
-    console.error(`[Price] ${symbol} error:`, e.message);
-    return null;
+    console.error(`[Price] ${s} Yahoo failed (${e.message}), falling back to on-chain`);
+    try {
+      if (!DEX) return null;
+      const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
+      const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [TOKENS[s].address, TOKENS.USDG.address]);
+      const price   = parseFloat(ethers.formatUnits(amounts[1], 6));
+      return { price, change: '0.00', symbol: s };
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -834,12 +843,8 @@ app.get('/prices', async (req, res) => {
   const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
   const result = {};
   await Promise.all(syms.map(async sym => {
-    try {
-      const data = await getStockPrice(sym);
-      result[sym] = data ? { price: data.price, prev: data.price } : null;
-    } catch {
-      result[sym] = null;
-    }
+    const data = await getStockPrice(sym);
+    result[sym] = data ? { price: data.price, prev: data.price, change: data.change } : null;
   }));
   res.json(result);
 });
