@@ -231,14 +231,26 @@ async function getStockPrice(symbol) {
   try {
     const pairAddr = DEP_PAIRS[s];
     if (!pairAddr) throw new Error(`No pair for ${s}`);
-    const pair   = new ethers.Contract(pairAddr, PAIR_ABI_PRICE, provider);
+    const pair     = new ethers.Contract(pairAddr, PAIR_ABI_PRICE, provider);
     const [r0, r1] = await pair.getReserves();
     const token0   = await pair.token0();
     const isUsdg0  = token0.toLowerCase() === TOKENS.USDG.address.toLowerCase();
     const rUSDG    = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
     const rSTOCK   = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
     if (!rSTOCK) throw new Error('zero reserves');
-    return { price: rUSDG / rSTOCK, change: '0.00', symbol: s };
+    const price = rUSDG / rSTOCK;
+
+    // Get prev close from Finnhub for change %
+    let change = '0.00';
+    if (FINNHUB_KEY) {
+      try {
+        const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`);
+        const q   = await res.json();
+        if (q?.pc) change = ((price - q.pc) / q.pc * 100).toFixed(2);
+      } catch {}
+    }
+
+    return { price, change, symbol: s };
   } catch (e) {
     console.error(`[Price] ${s} error:`, e.message);
     return null;
