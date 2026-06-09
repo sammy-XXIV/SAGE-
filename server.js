@@ -867,24 +867,35 @@ async function keeperGetDexPrice(sym) {
   return { price: rUSDG / rSTOCK, rUSDG, rSTOCK };
 }
 
+let keeperRunning = false;
 async function runPriceKeeper() {
-  if (!KEEPER_PK || !DEX) return;
+  if (!KEEPER_PK || !DEX || keeperRunning) return;
+  keeperRunning = true;
+  try { await _runPriceKeeper(); } finally { keeperRunning = false; }
+}
+async function _runPriceKeeper() {
   const keeper = new ethers.Wallet(KEEPER_PK, provider);
   const dep    = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8'));
   const router = new ethers.Contract(DEX.router, KEEPER_ROUTER_ABI, keeper);
 
   for (const sym of ['TSLA', 'AMZN', 'PLTR', 'NFLX', 'AMD']) {
     try {
-      const [market, dex] = await Promise.all([getStockPrice(sym), keeperGetDexPrice(sym)]);
-      if (!market || !dex) continue;
+      const finnRes = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+      const finnQ   = await finnRes.json();
+      console.log(`[Keeper] ${sym} raw:`, JSON.stringify(finnQ));
+      const marketPrice = finnQ?.c;
+      if (!marketPrice || marketPrice === 0) { console.log(`[Keeper] ${sym}: no Finnhub price`); continue; }
 
-      const deviation = Math.abs(dex.price - market.price) / market.price;
-      console.log(`[Keeper] ${sym} market=$${market.price.toFixed(2)} dex=$${dex.price.toFixed(2)} dev=${(deviation*100).toFixed(2)}%`);
+      const dex = await keeperGetDexPrice(sym);
+      if (!dex) continue;
+
+      const deviation = Math.abs(dex.price - marketPrice) / marketPrice;
+      console.log(`[Keeper] ${sym} market=$${marketPrice.toFixed(2)} dex=$${dex.price.toFixed(2)} dev=${(deviation*100).toFixed(2)}%`);
       if (deviation <= KEEPER_THRESHOLD) continue;
 
       const k          = dex.rUSDG * dex.rSTOCK;
-      const rUSDG_new  = Math.sqrt(k * market.price);
-      const rSTOCK_new = Math.sqrt(k / market.price);
+      const rUSDG_new  = Math.sqrt(k * marketPrice);
+      const rSTOCK_new = Math.sqrt(k / marketPrice);
       const deltaUSDG  = rUSDG_new - dex.rUSDG;
 
       let tokenIn, tokenOut, amountIn, decimalsIn;
