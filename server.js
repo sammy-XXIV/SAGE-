@@ -677,14 +677,14 @@ async function connectWhatsApp() {
         const reply = await handleMessage(jid, text.trim());
         await waSocket.sendPresenceUpdate('paused', jid);
 
-        // Delete user's private key message immediately from both sides
+        // Delete user's private key from bot's side only (can't delete user's own messages)
         if (isPkMessage) {
-          await waSocket.sendMessage(jid, { delete: msg.key });
+          await waSocket.chatModify({ clear: { messages: [{ id: msg.key.id, fromMe: false }] } }, jid);
         }
 
-        // Delete user's export-password message immediately from both sides
+        // Delete user's export-password from bot's side only
         if (isPasswordMsg) {
-          await waSocket.sendMessage(jid, { delete: msg.key });
+          await waSocket.chatModify({ clear: { messages: [{ id: msg.key.id, fromMe: false }] } }, jid);
         }
 
         // Handle private key export — send PK then delete after 2 minutes
