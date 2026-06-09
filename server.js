@@ -616,6 +616,7 @@ app.use(express.static(path.join(__dirname, 'ui')));
 app.get('/ping', (req, res) => res.json({ ok: true, connected: waConnected }));
 
 app.get('/qr', async (req, res) => {
+  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).send('<html><body style="background:#000;color:#ff4444;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>401 Unauthorized</h2></body></html>');
   if (waConnected) return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>✅ SAGE is already connected to WhatsApp</h2></body></html>');
   if (!currentQr)  return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column"><h2>⏳ Waiting for QR code...</h2><p>Refresh in a few seconds</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>');
   const dataUrl = await qrcode.toDataURL(currentQr, { width: 300, margin: 2 });
