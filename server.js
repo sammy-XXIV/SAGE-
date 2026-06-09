@@ -1,5 +1,5 @@
 import express from 'express';
-import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 import Pino from 'pino';
 import Anthropic from '@anthropic-ai/sdk';
 import { ethers } from 'ethers';
@@ -607,6 +607,54 @@ async function handleMessage(jid, text) {
   return reply;
 }
 
+// ── Supabase-backed Baileys auth state ────────────────────────
+async function useSupabaseAuthState() {
+  async function read(keyId) {
+    const { data } = await supabase.from('wa_sessions').select('data').eq('key_id', keyId).single();
+    if (!data) return null;
+    return JSON.parse(data.data, BufferJSON.reviver);
+  }
+
+  async function write(keyId, value) {
+    await supabase.from('wa_sessions').upsert(
+      { key_id: keyId, data: JSON.stringify(value, BufferJSON.replacer), updated_at: new Date().toISOString() },
+      { onConflict: 'key_id' }
+    );
+  }
+
+  async function remove(keyId) {
+    await supabase.from('wa_sessions').delete().eq('key_id', keyId);
+  }
+
+  const creds = (await read('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const result = {};
+          await Promise.all(ids.map(async id => {
+            const val = await read(`${type}-${id}`);
+            if (val) result[id] = val;
+          }));
+          return result;
+        },
+        set: async (data) => {
+          await Promise.all(
+            Object.entries(data).flatMap(([category, items]) =>
+              Object.entries(items).map(([id, value]) =>
+                value ? write(`${category}-${id}`, value) : remove(`${category}-${id}`)
+              )
+            )
+          );
+        },
+      },
+    },
+    saveCreds: () => write('creds', creds),
+  };
+}
+
 // ── WhatsApp connection ────────────────────────────────────────
 let waSocket    = null;
 let waConnected = false;
@@ -619,7 +667,7 @@ async function sendWAMessage(jid, text) {
 }
 
 async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+  const { state, saveCreds } = await useSupabaseAuthState();
   const { version }          = await fetchLatestBaileysVersion();
 
   waSocket = makeWASocket({
