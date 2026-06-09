@@ -281,20 +281,27 @@ async function monitorIncomingTransfers() {
   }
 }
 
-// ── Conversation history ───────────────────────────────────────
-const conversationHistory = new Map();
-const onboardingState    = new Map(); // jid -> 'awaiting_choice' | 'awaiting_pk' | 'awaiting_password_set' | 'awaiting_export_password' | 'done'
-const pendingExportJid   = new Map(); // jid -> true (waiting for password to export)
+// ── Conversation history (Supabase-backed) ────────────────────
+const historyCache  = new Map(); // jid -> messages[]
+const onboardingState    = new Map();
+const pendingExportJid   = new Map();
 
-function getHistory(jid) {
-  if (!conversationHistory.has(jid)) conversationHistory.set(jid, []);
-  return conversationHistory.get(jid);
+async function getHistory(jid) {
+  if (historyCache.has(jid)) return historyCache.get(jid);
+  const { data } = await supabase.from('conversation_history').select('messages').eq('jid', jid).single();
+  const msgs = data?.messages || [];
+  historyCache.set(jid, msgs);
+  return msgs;
 }
 
-function addToHistory(jid, role, content) {
-  const h = getHistory(jid);
+async function addToHistory(jid, role, content) {
+  const h = await getHistory(jid);
   h.push({ role, content });
   if (h.length > 20) h.splice(0, h.length - 20);
+  await supabase.from('conversation_history').upsert(
+    { jid, messages: h, updated_at: new Date().toISOString() },
+    { onConflict: 'jid' }
+  );
 }
 
 // ── SAGE Tools ────────────────────────────────────────────────
@@ -569,8 +576,8 @@ async function handleMessage(jid, text) {
   const { data: walletRow } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
   const dynamicSystem = SYSTEM_PROMPT + (walletRow ? `\n\nThis user's wallet address is: ${walletRow.address}` : '');
 
-  addToHistory(jid, 'user', text);
-  const history = getHistory(jid);
+  await addToHistory(jid, 'user', text);
+  const history = await getHistory(jid);
 
   let response = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
@@ -589,21 +596,21 @@ async function handleMessage(jid, text) {
       toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: JSON.stringify(result) });
     }
 
-    addToHistory(jid, 'assistant', response.content);
-    addToHistory(jid, 'user', toolResults);
+    await addToHistory(jid, 'assistant', response.content);
+    await addToHistory(jid, 'user', toolResults);
 
     response = await anthropic.messages.create({
       model:      'claude-haiku-4-5-20251001',
       max_tokens: 1024,
       system:     dynamicSystem,
       tools:      sageTools,
-      messages:   getHistory(jid),
+      messages:   await getHistory(jid),
     });
   }
 
   const textBlock = response.content.find(b => b.type === 'text');
   const reply     = textBlock?.text || 'Something went wrong — try again.';
-  addToHistory(jid, 'assistant', reply);
+  await addToHistory(jid, 'assistant', reply);
   return reply;
 }
 
