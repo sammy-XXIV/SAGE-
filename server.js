@@ -417,6 +417,50 @@ const sageTools = [
       required: ['from_symbol', 'to_symbol', 'amount_in', 'min_amount_out'],
     },
   },
+  {
+    name: 'set_price_alert',
+    description: 'Set a price alert for a stock. SAGE will notify the user on WhatsApp when the price crosses the target.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        symbol:       { type: 'string', description: 'Stock symbol: TSLA, AMZN, PLTR, NFLX, AMD' },
+        condition:    { type: 'string', enum: ['above', 'below'], description: 'Trigger when price goes above or below target' },
+        target_price: { type: 'number', description: 'Price threshold in USDG' },
+      },
+      required: ['symbol', 'condition', 'target_price'],
+    },
+  },
+  {
+    name: 'set_limit_order',
+    description: 'Place a limit order — automatically buy or sell when price hits target. User must have enough USDG (buy) or stock (sell) in their SAGE wallet.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        symbol:       { type: 'string', description: 'Stock symbol: TSLA, AMZN, PLTR, NFLX, AMD' },
+        action:       { type: 'string', enum: ['buy', 'sell'], description: 'Buy or sell' },
+        condition:    { type: 'string', enum: ['above', 'below'], description: 'Execute when price goes above or below target' },
+        target_price: { type: 'number', description: 'Trigger price in USDG' },
+        amount:       { type: 'number', description: 'Amount of USDG to spend (buy) or stock amount to sell' },
+      },
+      required: ['symbol', 'action', 'condition', 'target_price', 'amount'],
+    },
+  },
+  {
+    name: 'get_trade_history',
+    description: 'Get the user\'s recent trade history on the SAGE DEX.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Number of recent trades to fetch (default 10, max 50)' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_faucet',
+    description: 'Get faucet link for testnet ETH on Robinhood Chain, plus the user\'s wallet address for easy copy-paste.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────
@@ -489,6 +533,54 @@ async function executeTool(name, input, jid) {
       return result;
     }
 
+    if (name === 'set_price_alert') {
+      const { symbol, condition, target_price } = input;
+      const { error } = await supabase.from('rh_alerts').insert({
+        jid, type: 'alert', symbol: symbol.toUpperCase(), condition, target_price,
+      });
+      if (error) return { error: error.message };
+      return { success: true, message: `Alert set: notify when ${symbol.toUpperCase()} goes ${condition} $${target_price}` };
+    }
+
+    if (name === 'set_limit_order') {
+      const { symbol, action, condition, target_price, amount } = input;
+      const { error } = await supabase.from('rh_alerts').insert({
+        jid, type: 'limit', symbol: symbol.toUpperCase(), condition, target_price, action, amount,
+      });
+      if (error) return { error: error.message };
+      return { success: true, message: `Limit order set: ${action} ${amount} ${action === 'buy' ? 'USDG of' : ''} ${symbol.toUpperCase()} when price goes ${condition} $${target_price}` };
+    }
+
+    if (name === 'get_trade_history') {
+      const limit = Math.min(input.limit || 10, 50);
+      const { data, error } = await supabase
+        .from('rh_trades')
+        .select('*')
+        .eq('jid', jid)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      if (error) return { error: error.message };
+      if (!data || data.length === 0) return { trades: [], message: 'No trades yet.' };
+      return { trades: data.map(t => ({
+        date:      new Date(t.created_at).toLocaleDateString(),
+        side:      t.side,
+        symbol:    t.symbol,
+        amountIn:  t.amount_in,
+        amountOut: t.amount_out,
+        price:     t.price_usdg,
+        tx:        t.tx_hash ? `https://explorer.testnet.chain.robinhood.com/tx/${t.tx_hash}` : null,
+      })) };
+    }
+
+    if (name === 'get_faucet') {
+      const row = await getOrCreateWallet(jid);
+      return {
+        faucetUrl: 'https://faucet.testnet.chain.robinhood.com/',
+        address: row.address,
+        message: `Paste your address at the faucet to get testnet ETH.`,
+      };
+    }
+
     return { error: 'Unknown tool' };
   } catch (e) {
     console.error(`Tool error [${name}]:`, e.message);
@@ -513,6 +605,10 @@ Your capabilities:
 - Fetch live stock prices and 24h changes
 - Send ETH and stock tokens to any address
 - **Trade tokenized stocks** — buy/sell TSLA, AMZN, PLTR, NFLX, AMD against USDG on the SAGE DEX
+- **Price alerts** — notify user when a stock crosses a price threshold
+- **Limit orders** — auto-execute a buy or sell when price hits target
+- **Trade history** — show recent swaps with dates and tx links
+- **Faucet** — give user the testnet ETH faucet link + their address
 - Explain what Robinhood Chain is and how tokenized stocks work
 
 Personality:
@@ -548,6 +644,25 @@ TRADING STOCKS:
 - After swap: show tx hash + explorer link + what they received
 - Swaps go through the SAGE DEX — a Uniswap V2 AMM deployed on Robinhood Chain
 - Supported pairs: USDG/TSLA, USDG/AMZN, USDG/PLTR, USDG/NFLX, USDG/AMD
+
+PRICE ALERTS:
+- When user says "alert me when TSLA hits $X" or similar: call set_price_alert
+- Confirm: "Alert set — I'll message you when TSLA goes above/below $X."
+- Alerts trigger automatically in the background
+
+LIMIT ORDERS:
+- When user says "buy $X USDG of TSLA if it drops to $Y": call set_limit_order with action=buy, condition=below
+- When user says "sell N TSLA if it hits $Y": call set_limit_order with action=sell, condition=above
+- Confirm the order details and note it will auto-execute
+
+TRADE HISTORY:
+- When user asks for trade history or "what have I traded?": call get_trade_history
+- Format each trade as: "BUY 0.04 TSLA @ $394 on 6/9"
+- Show tx link for each trade
+
+FAUCET:
+- When user asks for testnet ETH, gas, or faucet: call get_faucet
+- Display their address and the faucet URL clearly
 
 EXPORTING PRIVATE KEY:
 - If the user asks to export or see their private key, reply EXACTLY with: __TRIGGER_EXPORT__
@@ -981,13 +1096,81 @@ async function _runPriceKeeper() {
   }
 }
 
+// ── Alert / limit-order monitor ───────────────────────────────
+let alertRunning = false;
+async function runAlertMonitor() {
+  if (alertRunning) return;
+  alertRunning = true;
+  try {
+    const { data: alerts } = await supabase
+      .from('rh_alerts')
+      .select('*')
+      .eq('triggered', false);
+
+    if (!alerts || alerts.length === 0) return;
+
+    // Group by symbol to avoid redundant price fetches
+    const bySymbol = {};
+    for (const a of alerts) {
+      if (!bySymbol[a.symbol]) bySymbol[a.symbol] = [];
+      bySymbol[a.symbol].push(a);
+    }
+
+    for (const [sym, rows] of Object.entries(bySymbol)) {
+      const priceData = await getStockPrice(sym);
+      if (!priceData) continue;
+      const { price } = priceData;
+
+      for (const alert of rows) {
+        const triggered =
+          (alert.condition === 'above' && price >= alert.target_price) ||
+          (alert.condition === 'below' && price <= alert.target_price);
+        if (!triggered) continue;
+
+        if (alert.type === 'alert') {
+          await sendWAMessage(alert.jid,
+            `🔔 *Price Alert Triggered*\n${sym} is now $${price.toFixed(2)} — ${alert.condition} your target of $${alert.target_price}`
+          );
+        } else if (alert.type === 'limit') {
+          // Execute the limit order
+          try {
+            const fromSym = alert.action === 'buy' ? 'USDG' : sym;
+            const toSym   = alert.action === 'buy' ? sym : 'USDG';
+            const quote   = await getSwapQuote(fromSym, toSym, Number(alert.amount));
+            if (quote.error) throw new Error(quote.error);
+            const minOut  = quote.amountOut * 0.99;
+            const result  = await executeSwap(alert.jid, fromSym, toSym, Number(alert.amount), minOut);
+            if (result.error) throw new Error(result.error);
+            await sendWAMessage(alert.jid,
+              `✅ *Limit Order Executed*\n${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${price.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
+            );
+          } catch (e) {
+            await sendWAMessage(alert.jid,
+              `⚠️ *Limit Order Failed*\n${sym} hit $${price.toFixed(2)} but order failed: ${e.message}`
+            );
+          }
+        }
+
+        // Mark triggered
+        await supabase.from('rh_alerts').update({ triggered: true }).eq('id', alert.id);
+      }
+    }
+  } catch (e) {
+    console.error('[AlertMonitor] error:', e.message);
+  } finally {
+    alertRunning = false;
+  }
+}
+
 // ── Start ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`SAGE-RH running on port ${PORT}`));
 connectWhatsApp();
 
-// Start price keeper after 10s delay, then every 60s
+// Start price keeper + alert monitor after 10s delay, then every 60s
 setTimeout(() => {
   runPriceKeeper();
+  runAlertMonitor();
   setInterval(runPriceKeeper, 60_000);
+  setInterval(runAlertMonitor, 60_000);
 }, 10_000);
