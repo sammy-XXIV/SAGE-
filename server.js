@@ -223,14 +223,22 @@ const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', 
 
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
+const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8')).pairs;
+const PAIR_ABI_PRICE = ['function getReserves() view returns (uint112,uint112,uint32)', 'function token0() view returns (address)'];
+
 async function getStockPrice(symbol) {
   const s = symbol.toUpperCase();
   try {
-    if (!DEX) throw new Error('DEX not loaded');
-    const router  = new ethers.Contract(DEX.router, ROUTER_ABI, provider);
-    const amounts = await router.getAmountsOut(ethers.parseUnits('1', 18), [TOKENS[s].address, TOKENS.USDG.address]);
-    const price   = parseFloat(ethers.formatUnits(amounts[1], 6));
-    return { price, change: '0.00', symbol: s };
+    const pairAddr = DEP_PAIRS[s];
+    if (!pairAddr) throw new Error(`No pair for ${s}`);
+    const pair   = new ethers.Contract(pairAddr, PAIR_ABI_PRICE, provider);
+    const [r0, r1] = await pair.getReserves();
+    const token0   = await pair.token0();
+    const isUsdg0  = token0.toLowerCase() === TOKENS.USDG.address.toLowerCase();
+    const rUSDG    = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
+    const rSTOCK   = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
+    if (!rSTOCK) throw new Error('zero reserves');
+    return { price: rUSDG / rSTOCK, change: '0.00', symbol: s };
   } catch (e) {
     console.error(`[Price] ${s} error:`, e.message);
     return null;
