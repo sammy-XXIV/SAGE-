@@ -483,7 +483,12 @@ TRADING STOCKS:
 
 EXPORTING PRIVATE KEY:
 - If the user asks to export or see their private key, reply EXACTLY with: __TRIGGER_EXPORT__
-- Do not say anything else, do not explain — just that token`;
+- Do not say anything else, do not explain — just that token
+
+UNSUPPORTED REQUESTS:
+- If the user asks to change their password, say: "Password change isn't supported yet. If you need to reset it, export your private key and reimport your wallet."
+- Never make up features, apps, or systems that don't exist
+- If you can't do something, say so directly in one line`;
 
 // ── Claude message handler ────────────────────────────────────
 async function handleMessage(jid, text) {
