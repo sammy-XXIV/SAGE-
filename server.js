@@ -287,6 +287,7 @@ async function monitorIncomingTransfers() {
 
 // ── Conversation history ───────────────────────────────────────
 const conversationHistory = new Map();
+const onboardingState    = new Map(); // jid -> 'awaiting_choice' | 'awaiting_pk' | 'done'
 
 function getHistory(jid) {
   if (!conversationHistory.has(jid)) conversationHistory.set(jid, []);
@@ -485,16 +486,60 @@ TRADING STOCKS:
 
 // ── Claude message handler ────────────────────────────────────
 async function handleMessage(jid, text) {
-  // Auto-create wallet on first interaction and inject address into context
-  const walletRow = await getOrCreateWallet(jid);
-  const isFirstMessage = getHistory(jid).length === 0;
+  const state = onboardingState.get(jid);
+
+  // ── Onboarding: first ever message ───────────────────────────
+  if (!state) {
+    // Check if wallet already exists in DB
+    const { data } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
+    if (data) {
+      // Returning user — skip onboarding
+      onboardingState.set(jid, 'done');
+    } else {
+      onboardingState.set(jid, 'awaiting_choice');
+      return `👋 Welcome to *SAGE* — your DeFi agent on Robinhood Chain.\n\nTrade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nTo get started, would you like to:\n\n*1️⃣ Generate a new wallet*\n*2️⃣ Import an existing wallet*\n\nReply *1* or *2*`;
+    }
+  }
+
+  // ── Onboarding: waiting for 1 or 2 ───────────────────────────
+  if (state === 'awaiting_choice') {
+    const choice = text.trim();
+    if (choice === '1') {
+      const wallet = ethers.Wallet.createRandom();
+      const encrypted_pk = encrypt(wallet.privateKey);
+      await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
+      activeWalletRegistry.set(jid, wallet.address);
+      onboardingState.set(jid, 'done');
+      return `✅ *Wallet created!*\n\n📬 Address:\n\`${wallet.address}\`\n\nFund it with testnet ETH to start trading:\nhttps://faucet.testnet.chain.robinhood.com/\n\nOnce funded, just say *"buy $10 of TSLA"* or *"show my portfolio"* 🚀`;
+    } else if (choice === '2') {
+      onboardingState.set(jid, 'awaiting_pk');
+      return `🔑 Send your *private key* and I'll import your wallet.\n\n⚠️ It will be encrypted and stored securely. Never share it with anyone else.`;
+    } else {
+      return `Please reply *1* to generate a new wallet or *2* to import an existing one.`;
+    }
+  }
+
+  // ── Onboarding: waiting for private key ──────────────────────
+  if (state === 'awaiting_pk') {
+    try {
+      const pk = text.trim().startsWith('0x') ? text.trim() : `0x${text.trim()}`;
+      const wallet = new ethers.Wallet(pk);
+      const encrypted_pk = encrypt(wallet.privateKey);
+      await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
+      activeWalletRegistry.set(jid, wallet.address);
+      onboardingState.set(jid, 'done');
+      return `✅ *Wallet imported!*\n\n📬 Address:\n\`${wallet.address}\`\n\nJust say *"show my portfolio"* or *"buy $10 of TSLA"* to get started 🚀`;
+    } catch {
+      return `❌ Invalid private key. Please try again or reply *1* to generate a new wallet instead.`;
+    }
+  }
+
+  // ── Normal AI flow (onboarding done) ─────────────────────────
+  const { data: walletRow } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
+  const dynamicSystem = SYSTEM_PROMPT + (walletRow ? `\n\nThis user's wallet address is: ${walletRow.address}` : '');
 
   addToHistory(jid, 'user', text);
   const history = getHistory(jid);
-
-  const dynamicSystem = SYSTEM_PROMPT +
-    `\n\nThis user's wallet address is: ${walletRow.address}` +
-    (isFirstMessage ? `\n\nThis is their FIRST message. Greet them, tell them their wallet has been set up, show their address, and tell them to fund it with testnet ETH from https://faucet.testnet.chain.robinhood.com/ to start trading.` : '');
 
   let response = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
