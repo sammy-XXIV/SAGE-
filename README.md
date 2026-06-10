@@ -91,7 +91,7 @@ A background price keeper runs every 60s, fetches Finnhub market prices, and swa
 
 ## Running locally
 
-1. Copy env vars (see below) into a `.env` file
+1. Add env vars to a `.env` file
 2. `npm install`
 3. `npm start` — starts the WhatsApp bot + Express API
 4. Scan the QR code with WhatsApp linked devices
@@ -99,21 +99,6 @@ A background price keeper runs every 60s, fetches Finnhub market prices, and swa
 ```bash
 # Separate terminal — local price keeper (optional, Railway runs it in-process)
 npm run price-keeper
-```
-
-### Environment variables
-
-Create a `.env` file in the project root:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-supabase-service-role-key
-ENCRYPTION_KEY=any-random-32-character-string
-DEPLOYER_PRIVATE_KEY=0x...     # wallet that owns the LP and runs the price keeper
-FINNHUB_API_KEY=...            # free tier works — used by price keeper only
-RPC_URL=https://rpc.testnet.chain.robinhood.com
-PORT=3001
 ```
 
 ---
