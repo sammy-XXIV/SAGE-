@@ -257,6 +257,9 @@ const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', 
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
 const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8')).pairs;
+
+// ── Per-user spending limits (in-memory, set via set_spending_limit tool) ──
+const spendingLimits = new Map(); // jid → max USDG per trade
 const PAIR_ABI_PRICE = ['function getReserves() view returns (uint112,uint112,uint32)', 'function token0() view returns (address)'];
 
 async function getStockPrice(symbol) {
@@ -421,7 +424,7 @@ const sageTools = [
   },
   {
     name: 'execute_swap',
-    description: 'Execute a token swap on the SAGE DEX. ONLY call this after showing the user a quote and receiving explicit confirmation (yes/confirm/proceed). Never call without confirmation.',
+    description: 'Execute a token swap on the SAGE DEX. ONLY call this after showing the user a quote and receiving explicit confirmation. If the risk guard returns a warning, show it to the user and only set force=true if they explicitly say to proceed anyway.',
     input_schema: {
       type: 'object',
       properties: {
@@ -429,6 +432,7 @@ const sageTools = [
         to_symbol:      { type: 'string', description: 'Token to buy' },
         amount_in:      { type: 'number', description: 'Exact amount to sell' },
         min_amount_out: { type: 'number', description: 'Minimum amount to receive (from quote, apply 1% slippage)' },
+        force:          { type: 'boolean', description: 'Set true only if user explicitly confirmed after seeing a risk guard warning.' },
       },
       required: ['from_symbol', 'to_symbol', 'amount_in', 'min_amount_out'],
     },
@@ -476,6 +480,17 @@ const sageTools = [
     name: 'get_faucet',
     description: 'Get faucet link for testnet ETH on Robinhood Chain, plus the user\'s wallet address for easy copy-paste.',
     input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'set_spending_limit',
+    description: 'Set a maximum USDG-equivalent trade size per swap. SAGE will block any swap that exceeds this value and ask the user to confirm before proceeding. Set limit_usdg to 0 to disable.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit_usdg: { type: 'number', description: 'Max USDG value per trade. 0 = disabled.' },
+      },
+      required: ['limit_usdg'],
+    },
   },
 ];
 
@@ -545,7 +560,96 @@ async function executeTool(name, input, jid) {
     }
 
     if (name === 'execute_swap') {
-      const result = await executeSwap(jid, input.from_symbol, input.to_symbol, input.amount_in, input.min_amount_out);
+      const fromSym = input.from_symbol.toUpperCase();
+      const toSym   = input.to_symbol.toUpperCase();
+      const amtIn   = parseFloat(input.amount_in);
+      const force   = !!input.force;
+
+      if (!force) {
+        // ── 1. Spending limit ───────────────────────────────────────
+        const limit = spendingLimits.get(jid);
+        if (limit && limit > 0) {
+          let tradeValueUsdg = amtIn;
+          if (fromSym !== 'USDG') {
+            const p = await getStockPrice(fromSym);
+            tradeValueUsdg = p ? p.price * amtIn : amtIn;
+          }
+          if (tradeValueUsdg > limit) {
+            return {
+              blocked: true,
+              reason: 'spending_limit',
+              message: `🛡️ *SAGE Risk Guard*: trade blocked — ~$${tradeValueUsdg.toFixed(2)} exceeds your spending limit of $${limit} USDG per trade. Say "update my spending limit" to change it, or "proceed anyway" to override.`,
+            };
+          }
+        }
+
+        // ── 2. Price impact (reserves-based) ───────────────────────
+        const isSimplePair = fromSym === 'USDG' || toSym === 'USDG';
+        if (DEX && isSimplePair) {
+          try {
+            const stockSym = fromSym === 'USDG' ? toSym : fromSym;
+            const pair     = new ethers.Contract(DEP_PAIRS[stockSym], PAIR_ABI_PRICE, provider);
+            const [r0, r1] = await pair.getReserves();
+            const token0   = await pair.token0();
+            const isUsdg0  = token0.toLowerCase() === TOKENS.USDG.address.toLowerCase();
+            const rUSDG    = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
+            const rSTOCK   = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
+            const spot     = rUSDG / rSTOCK;
+
+            let impact = 0;
+            if (fromSym === 'USDG') {
+              const out      = (amtIn * 997 * rSTOCK) / (rUSDG * 1000 + amtIn * 997);
+              const effective = amtIn / out;
+              impact = Math.abs((effective - spot) / spot * 100);
+            } else {
+              const out      = (amtIn * 997 * rUSDG) / (rSTOCK * 1000 + amtIn * 997);
+              const effective = out / amtIn;
+              impact = Math.abs((spot - effective) / spot * 100);
+            }
+
+            if (impact > 8) {
+              return {
+                blocked: true,
+                reason: 'price_impact',
+                impact: impact.toFixed(1),
+                message: `🛡️ *SAGE Risk Guard*: price impact is ${impact.toFixed(1)}% — above the 8% safety threshold. The pool is thin for this trade size. Try a smaller amount, or say "proceed anyway" to override.`,
+              };
+            }
+          } catch (e) {
+            console.error('[RiskGuard] impact check failed:', e.message);
+          }
+        }
+
+        // ── 3. Portfolio concentration ──────────────────────────────
+        try {
+          const row      = await getOrCreateWallet(jid);
+          const holdings = await getPortfolio(row.address);
+          let portfolioUsdg = 0;
+          for (const h of holdings) {
+            if (h.symbol === 'USDG') { portfolioUsdg += h.amount; continue; }
+            const p = await getStockPrice(h.symbol);
+            if (p) portfolioUsdg += h.amount * p.price;
+          }
+          let tradeUsdg = amtIn;
+          if (fromSym !== 'USDG') {
+            const p = await getStockPrice(fromSym);
+            tradeUsdg = p ? p.price * amtIn : amtIn;
+          }
+          const pct = portfolioUsdg > 0 ? (tradeUsdg / portfolioUsdg * 100) : 0;
+          if (pct > 25) {
+            return {
+              blocked: true,
+              reason: 'concentration',
+              pct: pct.toFixed(0),
+              message: `🛡️ *SAGE Risk Guard*: this trade is ${pct.toFixed(0)}% of your portfolio (~$${tradeUsdg.toFixed(2)} of $${portfolioUsdg.toFixed(2)} total). Say "proceed anyway" to execute, or reduce the amount.`,
+            };
+          }
+        } catch (e) {
+          console.error('[RiskGuard] concentration check failed:', e.message);
+        }
+      }
+
+      const result = await executeSwap(jid, fromSym, toSym, amtIn, input.min_amount_out);
       return result;
     }
 
@@ -586,6 +690,16 @@ async function executeTool(name, input, jid) {
         price:     t.price_usdg,
         tx:        t.tx_hash ? `https://explorer.testnet.chain.robinhood.com/tx/${t.tx_hash}` : null,
       })) };
+    }
+
+    if (name === 'set_spending_limit') {
+      const limit = parseFloat(input.limit_usdg);
+      if (!limit || limit <= 0) {
+        spendingLimits.delete(jid);
+        return { success: true, message: 'Spending limit removed. All trade sizes allowed.' };
+      }
+      spendingLimits.set(jid, limit);
+      return { success: true, message: `Spending limit set to $${limit} USDG per trade. SAGE will warn you before any larger swap.` };
     }
 
     if (name === 'get_faucet') {
