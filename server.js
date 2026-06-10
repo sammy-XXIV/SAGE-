@@ -119,16 +119,22 @@ async function getPortfolio(address) {
   const ethAmt = parseFloat(ethers.formatEther(ethBal));
   if (ethAmt > 0) holdings.push({ symbol: 'ETH', amount: ethAmt, address: 'native' });
 
-  // ERC-20 balances
-  for (const [symbol, info] of Object.entries(TOKENS)) {
-    if (info.address === 'native') continue;
-    try {
-      const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
-      const bal = await contract.balanceOf(address);
-      const amt = parseFloat(ethers.formatUnits(bal, info.decimals));
-      if (amt > 0) holdings.push({ symbol, amount: amt, address: info.address, name: info.name });
-    } catch {}
-  }
+  // ERC-20 balances — fetch all in parallel, retry once on failure
+  await Promise.all(Object.entries(TOKENS).map(async ([symbol, info]) => {
+    if (info.address === 'native') return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
+        const bal = await contract.balanceOf(address);
+        const amt = parseFloat(ethers.formatUnits(bal, info.decimals));
+        if (amt > 0) holdings.push({ symbol, amount: amt, address: info.address, name: info.name });
+        return;
+      } catch (e) {
+        if (attempt === 1) console.error(`[Portfolio] ${symbol} balanceOf failed:`, e.message);
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  }));
 
   return holdings;
 }
