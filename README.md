@@ -103,14 +103,16 @@ npm run price-keeper
 
 ### Environment variables
 
+Create a `.env` file in the project root:
+
 ```
-ANTHROPIC_API_KEY=
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-ENCRYPTION_KEY=          # 32-char key for wallet private key encryption
+ANTHROPIC_API_KEY=sk-ant-...
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-supabase-service-role-key
+ENCRYPTION_KEY=any-random-32-character-string
+DEPLOYER_PRIVATE_KEY=0x...     # wallet that owns the LP and runs the price keeper
+FINNHUB_API_KEY=...            # free tier works — used by price keeper only
 RPC_URL=https://rpc.testnet.chain.robinhood.com
-FINNHUB_API_KEY=
-KEEPER_PRIVATE_KEY=      # Funded keeper wallet for DEX rebalancing
 PORT=3001
 ```
 
