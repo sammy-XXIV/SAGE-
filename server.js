@@ -1044,6 +1044,13 @@ const PAIR_ABI_KEEPER = [
   'function token0() view returns (address)',
 ];
 
+const SAGE_ORACLE_ADDRESS = process.env.SAGE_ORACLE || '0x47543D0d0eE57F08f5FBe213795d4078b4900C7D';
+const SAGE_ORACLE_ABI = [
+  'function updateAll() external',
+  'function spotPrice(address stock) external view returns (uint256)',
+  'function allSpotPrices() external view returns (address[] memory, uint256[] memory)',
+];
+
 async function keeperGetDexPrice(sym) {
   if (!DEX) return null;
   const dep = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8'));
@@ -1109,6 +1116,16 @@ async function _runPriceKeeper() {
     } catch (e) {
       console.error(`[Keeper] ${sym} error:`, e.message);
     }
+  }
+
+  // Push fresh TWAP snapshots to SageOracle after every keeper run
+  try {
+    const oracle = new ethers.Contract(SAGE_ORACLE_ADDRESS, SAGE_ORACLE_ABI, keeper);
+    const tx = await oracle.updateAll();
+    await tx.wait();
+    console.log(`[Keeper] SageOracle updated — ${tx.hash.slice(0,18)}…`);
+  } catch (e) {
+    console.error('[Keeper] SageOracle updateAll error:', e.message);
   }
 }
 
