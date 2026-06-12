@@ -16,6 +16,7 @@ import 'dotenv/config';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app  = express();
+app.set('trust proxy', 1); // behind Railway's proxy — needed so rate limiting keys on real client IPs
 app.use(express.json());
 
 // ── Rate limiting ─────────────────────────────────────────────
@@ -29,6 +30,24 @@ const RPC_URL        = process.env.RPC_URL || 'https://rpc.testnet.chain.robinho
 const CHAIN_ID       = 46630;
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 if (!ENCRYPTION_KEY) throw new Error('ENCRYPTION_KEY env var is required — refusing to start without it');
+
+// Admin endpoint auth — separate from the wallet encryption key so a leaked
+// admin token can't decrypt wallet private keys. Falls back to ENCRYPTION_KEY
+// until ADMIN_KEY is set in Railway env vars.
+const ADMIN_KEY = process.env.ADMIN_KEY || ENCRYPTION_KEY;
+if (!process.env.ADMIN_KEY) console.warn('[Security] ADMIN_KEY not set — admin auth falls back to ENCRYPTION_KEY. Add a separate ADMIN_KEY env var.');
+
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+// Accepts x-admin-key header (preferred — query strings end up in access logs) or ?key= for backward compat
+function isAdmin(req) {
+  return safeEqual(req.get('x-admin-key') || req.query.key, ADMIN_KEY);
+}
 
 const provider  = new ethers.JsonRpcProvider(RPC_URL, { chainId: CHAIN_ID, name: 'robinhood-testnet' });
 const supabase  = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_KEY || '');
@@ -72,18 +91,27 @@ try {
 }
 
 // ── Encryption ─────────────────────────────────────────────────
-// New format: salt_hex:iv_hex:ciphertext  (random per-wallet salt)
-// Old format: iv_hex:ciphertext           (static salt — legacy, read-only)
+// v2 format:           v2:salt:iv:tag:ct   — AES-256-GCM, random per-secret salt (authenticated)
+// legacy CBC random:   salt:iv:ct          (3 parts)
+// legacy CBC static:   iv:ct               (2 parts, static 'salt')
 function encrypt(text) {
   const salt   = crypto.randomBytes(16);
-  const iv     = crypto.randomBytes(16);
+  const iv     = crypto.randomBytes(12);
   const key    = crypto.scryptSync(ENCRYPTION_KEY, salt, 32);
-  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-  return salt.toString('hex') + ':' + iv.toString('hex') + ':' + cipher.update(text, 'utf8', 'hex') + cipher.final('hex');
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct     = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return ['v2', salt.toString('hex'), iv.toString('hex'), cipher.getAuthTag().toString('hex'), ct.toString('hex')].join(':');
 }
 
 function decrypt(enc) {
   const parts = enc.split(':');
+  if (parts[0] === 'v2') {
+    const [, saltHex, ivHex, tagHex, ctHex] = parts;
+    const key = crypto.scryptSync(ENCRYPTION_KEY, Buffer.from(saltHex, 'hex'), 32);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return decipher.update(Buffer.from(ctHex, 'hex'), undefined, 'utf8') + decipher.final('utf8');
+  }
   let key, iv, data;
   if (parts.length === 3) {
     const [saltHex, ivHex, ciphertext] = parts;
@@ -99,6 +127,27 @@ function decrypt(enc) {
   }
   const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
   return decipher.update(data, 'hex', 'utf8') + decipher.final('utf8');
+}
+
+// ── Session encryption (fast path) ─────────────────────────────
+// Baileys writes session keys dozens of times per message — per-write scrypt
+// would peg the CPU. Derive the session key ONCE at boot, random IV per write.
+// Wallet PKs keep the per-secret scrypt salt above (rare writes, higher stakes).
+const SESSION_KEY = crypto.scryptSync(ENCRYPTION_KEY, 'sage-wa-sessions-v1', 32);
+
+function encryptSession(text) {
+  const iv     = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', SESSION_KEY, iv);
+  const ct     = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return ['s1', iv.toString('hex'), cipher.getAuthTag().toString('hex'), ct.toString('hex')].join(':');
+}
+
+function decryptSession(enc) {
+  const [v, ivHex, tagHex, ctHex] = enc.split(':');
+  if (v !== 's1') throw new Error('not session format');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', SESSION_KEY, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  return decipher.update(Buffer.from(ctHex, 'hex'), undefined, 'utf8') + decipher.final('utf8');
 }
 
 // ── Wallet helpers ─────────────────────────────────────────────
@@ -281,8 +330,39 @@ const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
 const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8')).pairs;
 
-// ── Per-user spending limits (in-memory, set via set_spending_limit tool) ──
-const spendingLimits = new Map(); // jid → max USDG per trade
+// ── Per-user spending limits (cached in-memory, persisted to Supabase) ──
+// Stored as a config row in rh_alerts (type='config', triggered=true so the
+// alert monitor and get_orders never pick it up) — survives Railway redeploys.
+const spendingLimits = new Map(); // jid → max USDG per trade (cache)
+
+async function getSpendingLimit(jid) {
+  if (spendingLimits.has(jid)) return spendingLimits.get(jid);
+  let limit = 0;
+  try {
+    const { data } = await supabase.from('rh_alerts').select('target_price')
+      .eq('jid', jid).eq('type', 'config').eq('symbol', 'SPENDING_LIMIT').maybeSingle();
+    limit = data?.target_price || 0;
+  } catch (e) {
+    console.error('[SpendingLimit] load failed:', e.message);
+  }
+  spendingLimits.set(jid, limit);
+  return limit;
+}
+
+async function setSpendingLimit(jid, limit) {
+  spendingLimits.set(jid, limit);
+  try {
+    await supabase.from('rh_alerts').delete().eq('jid', jid).eq('type', 'config').eq('symbol', 'SPENDING_LIMIT');
+    if (limit > 0) {
+      const { error } = await supabase.from('rh_alerts').insert({
+        jid, type: 'config', symbol: 'SPENDING_LIMIT', condition: 'above', target_price: limit, triggered: true,
+      });
+      if (error) console.error('[SpendingLimit] persist failed:', error.message);
+    }
+  } catch (e) {
+    console.error('[SpendingLimit] persist failed:', e.message);
+  }
+}
 
 // ── Pending limit order setup confirmations (confirm at order placement, not execution) ──
 const pendingLimitOrders = new Map(); // jid → order details (waiting for yes/no before saving to DB)
@@ -633,7 +713,7 @@ async function executeTool(name, input, jid) {
 
       if (!force) {
         // ── 1. Spending limit ───────────────────────────────────────
-        const limit = spendingLimits.get(jid);
+        const limit = await getSpendingLimit(jid);
         if (limit && limit > 0) {
           let tradeValueUsdg = amtIn;
           if (fromSym !== 'USDG') {
@@ -719,7 +799,17 @@ async function executeTool(name, input, jid) {
         }
       }
 
-      const result = await executeSwap(jid, fromSym, toSym, amtIn, input.min_amount_out);
+      // Server-side slippage floor — don't trust the AI-supplied min_amount_out alone.
+      // A fresh quote sets the floor at 3% below expected output; the AI value can only tighten it.
+      let minOut;
+      try {
+        const q = await getSwapQuote(fromSym, toSym, amtIn);
+        minOut = Math.max(parseFloat(input.min_amount_out) || 0, q.amountOut * 0.97);
+      } catch (e) {
+        return { error: `Could not verify swap price: ${e.message}` };
+      }
+
+      const result = await executeSwap(jid, fromSym, toSym, amtIn, minOut);
       return result;
     }
 
@@ -762,6 +852,22 @@ async function executeTool(name, input, jid) {
       const fromSym = action === 'buy' ? 'USDG' : sym;
       const toSym   = action === 'buy' ? sym : 'USDG';
 
+      // Verify funds exist now — the order auto-executes later with no further checks
+      try {
+        const row = await getOrCreateWallet(jid);
+        const checkSym  = fromSym;
+        const contract  = new ethers.Contract(TOKENS[checkSym].address, ERC20_ABI, provider);
+        const bal = parseFloat(ethers.formatUnits(await contract.balanceOf(row.address), TOKENS[checkSym].decimals));
+        if (bal < amount) {
+          return {
+            success: false,
+            message: `⚠️ You have ${bal.toFixed(4)} ${checkSym} but this order needs ${amount}. Top up first or reduce the amount.`,
+          };
+        }
+      } catch (e) {
+        console.error('[LimitOrder] balance check failed:', e.message);
+      }
+
       // Store pending — don't save to DB until user confirms
       pendingLimitOrders.set(jid, { sym, action, condition, target_price, amount, fromSym, toSym });
 
@@ -778,6 +884,7 @@ async function executeTool(name, input, jid) {
         .select('*')
         .eq('jid', jid)
         .eq('triggered', false)
+        .neq('type', 'config')
         .order('created_at', { ascending: false });
       if (error) return { error: error.message };
       if (!data || data.length === 0) return { orders: [], message: 'No active orders or alerts.' };
@@ -797,10 +904,10 @@ async function executeTool(name, input, jid) {
     if (name === 'cancel_order') {
       const { data, error: fetchErr } = await supabase
         .from('rh_alerts')
-        .select('id, jid')
+        .select('id, jid, type')
         .eq('id', input.id)
         .single();
-      if (fetchErr || !data) return { error: 'Order not found.' };
+      if (fetchErr || !data || data.type === 'config') return { error: 'Order not found.' };
       if (data.jid !== jid) return { error: 'That order does not belong to you.' };
       const { error } = await supabase.from('rh_alerts').delete().eq('id', input.id);
       if (error) return { error: error.message };
@@ -831,10 +938,10 @@ async function executeTool(name, input, jid) {
     if (name === 'set_spending_limit') {
       const limit = parseFloat(input.limit_usdg);
       if (!limit || limit <= 0) {
-        spendingLimits.delete(jid);
+        await setSpendingLimit(jid, 0);
         return { success: true, message: 'Spending limit removed. All trade sizes allowed.' };
       }
-      spendingLimits.set(jid, limit);
+      await setSpendingLimit(jid, limit);
       return { success: true, message: `Spending limit set to $${limit} USDG per trade. SAGE will warn you before any larger swap.` };
     }
 
@@ -1013,6 +1120,7 @@ async function handleMessage(jid, text) {
 
   // ── Export private key: waiting for password ──────────────────
   if (state === 'awaiting_export_password') {
+    exportIntentJids.delete(jid); // consume the grant — no stale standing approvals
     const { data: row } = await supabase.from('rh_wallets').select('encrypted_pk, password_hash').eq('jid', jid).single();
     let passwordMatch = false;
     if (row.password_hash?.startsWith('scrypt:')) {
@@ -1088,16 +1196,20 @@ async function useSupabaseAuthState() {
     const { data, error } = await supabase.from('wa_sessions').select('data').eq('key_id', keyId).single();
     if (error && error.code !== 'PGRST116') console.error('[WA-AUTH] read error:', error.message);
     if (!data) return null;
-    // Try decrypt (new encrypted format), fall back to plain JSON (legacy)
+    // Try fast session format, then v2/CBC formats, then plain JSON (legacy)
     try {
-      return JSON.parse(decrypt(data.data), BufferJSON.reviver);
+      return JSON.parse(decryptSession(data.data), BufferJSON.reviver);
     } catch {
-      try { return JSON.parse(data.data, BufferJSON.reviver); } catch { return null; }
+      try {
+        return JSON.parse(decrypt(data.data), BufferJSON.reviver);
+      } catch {
+        try { return JSON.parse(data.data, BufferJSON.reviver); } catch { return null; }
+      }
     }
   }
 
   async function write(keyId, value) {
-    const encrypted = encrypt(JSON.stringify(value, BufferJSON.replacer));
+    const encrypted = encryptSession(JSON.stringify(value, BufferJSON.replacer));
     const { error } = await supabase.from('wa_sessions').upsert(
       { key_id: keyId, data: encrypted, updated_at: new Date().toISOString() },
       { onConflict: 'key_id' }
@@ -1304,7 +1416,7 @@ app.use(express.static(path.join(__dirname, 'ui')));
 app.get('/ping', (req, res) => res.json({ ok: true, connected: waConnected }));
 
 app.get('/qr', async (req, res) => {
-  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).send('<html><body style="background:#000;color:#ff4444;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>401 Unauthorized</h2></body></html>');
+  if (!isAdmin(req)) return res.status(401).send('<html><body style="background:#000;color:#ff4444;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>401 Unauthorized</h2></body></html>');
   if (waConnected) return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>✅ SAGE is already connected to WhatsApp</h2></body></html>');
   if (!currentQr)  return res.send('<html><body style="background:#000;color:#C8F135;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column"><h2>⏳ Waiting for QR code...</h2><p>Refresh in a few seconds</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>');
   const dataUrl = await qrcode.toDataURL(currentQr, { width: 300, margin: 2 });
@@ -1312,7 +1424,7 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/wallet/:jid', async (req, res) => {
-  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  if (!isAdmin(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
   try {
     const row = await getOrCreateWallet(req.params.jid);
     res.json({ ok: true, address: row.address });
@@ -1323,10 +1435,12 @@ app.get('/wallet/:jid', async (req, res) => {
 
 app.get('/portfolio/:address', async (req, res) => {
   try {
+    if (!ethers.isAddress(req.params.address)) return res.status(400).json({ ok: false, error: 'invalid address' });
     const holdings = await getPortfolio(req.params.address);
     res.json({ ok: true, holdings });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    console.error('[API] /portfolio error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
   }
 });
 
@@ -1335,12 +1449,13 @@ app.get('/price/:symbol', async (req, res) => {
     const data = await getStockPrice(req.params.symbol);
     res.json({ ok: !!data, ...data });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    console.error('[API] /price error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
   }
 });
 
 app.get('/admin/status', async (req, res) => {
-  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ error: 'unauthorized' });
+  if (!isAdmin(req)) return res.status(401).json({ error: 'unauthorized' });
   try {
     const keeper = new ethers.Wallet(KEEPER_PK, provider);
     const usdgContract = new ethers.Contract(TOKENS.USDG.address, ['function balanceOf(address) view returns (uint256)'], provider);
@@ -1363,7 +1478,7 @@ app.get('/admin/status', async (req, res) => {
 });
 
 app.get('/admin/keeper', async (req, res) => {
-  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ error: 'unauthorized' });
+  if (!isAdmin(req)) return res.status(401).json({ error: 'unauthorized' });
   try {
     await runPriceKeeper();
     res.json({ ok: true, message: 'Keeper run triggered' });
@@ -1488,6 +1603,7 @@ async function _runPriceKeeper() {
 
 // ── Alert / limit-order monitor ───────────────────────────────
 let alertRunning = false;
+const limitOrderFails = new Map(); // alert.id → consecutive execution failures
 async function runAlertMonitor() {
   if (alertRunning) return;
   alertRunning = true;
@@ -1495,7 +1611,8 @@ async function runAlertMonitor() {
     const { data: alerts } = await supabase
       .from('rh_alerts')
       .select('*')
-      .eq('triggered', false);
+      .eq('triggered', false)
+      .neq('type', 'config');
 
     if (!alerts || alerts.length === 0) return;
 
@@ -1532,12 +1649,24 @@ async function runAlertMonitor() {
             const minOut  = quote.amountOut * 0.99;
             const result  = await executeSwap(alert.jid, fromSym, toSym, Number(alert.amount), minOut);
             if (result.error) throw new Error(result.error);
+            limitOrderFails.delete(alert.id);
             await sendWAMessage(alert.jid,
               `✅ *Limit Order Executed*\n${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${price.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
             );
           } catch (e) {
+            // Don't consume the order on a transient failure — retry on the next
+            // monitor pass (60s), give up after 3 strikes.
+            const fails = (limitOrderFails.get(alert.id) || 0) + 1;
+            limitOrderFails.set(alert.id, fails);
+            if (fails < 3) {
+              await sendWAMessage(alert.jid,
+                `⚠️ *Limit Order Hiccup*\n${sym} hit $${price.toFixed(2)} but execution failed (attempt ${fails}/3): ${e.message}\nRetrying in ~60s.`
+              );
+              continue; // keep untriggered
+            }
+            limitOrderFails.delete(alert.id);
             await sendWAMessage(alert.jid,
-              `⚠️ *Limit Order Failed*\n${sym} hit $${price.toFixed(2)} but execution failed: ${e.message}`
+              `❌ *Limit Order Cancelled*\n${sym} hit $${price.toFixed(2)} but execution failed 3 times: ${e.message}\nThe order has been removed — place it again when ready.`
             );
           }
         }
