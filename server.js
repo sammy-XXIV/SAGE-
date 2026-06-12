@@ -90,6 +90,25 @@ try {
   console.log('No deployment.json found — swap features disabled until deploy');
 }
 
+// ── SageAccount (smart wallet) config ──────────────────────────
+// Per-user on-chain account that custodies USDG + stock tokens and enforces
+// the Risk Guard on-chain. The user's EOA is the session+owner key (server
+// holds it, pays gas, signs swaps); funds live in the account, so a leaked
+// session key can only trade within the daily cap, never withdraw.
+const SAGE_ACCOUNT_FACTORY = process.env.SAGE_ACCOUNT_FACTORY || '0xcBe2F33bBB9824f29d253C14a812Ac4B6faE86a5';
+const ACCOUNT_FACTORY_ABI = [
+  'function createAccount(bytes32 userId, address owner, address sessionKey) external returns (address account)',
+  'function accountOf(bytes32 userId) external view returns (address)',
+];
+const SAGE_ACCOUNT_ABI = [
+  'function swap(uint256 amountIn, uint256 amountOutMin, address[] path, uint256 deadline) external returns (uint256)',
+  'function withdraw(address token, address to, uint256 amount) external',
+  'function owner() view returns (address)',
+  'function sessionKey() view returns (address)',
+  'function remainingToday() view returns (uint256)',
+];
+function userIdFor(jid) { return ethers.keccak256(ethers.toUtf8Bytes(jid)); }
+
 // ── Encryption ─────────────────────────────────────────────────
 // v2 format:           v2:salt:iv:tag:ct   — AES-256-GCM, random per-secret salt (authenticated)
 // legacy CBC random:   salt:iv:ct          (3 parts)
@@ -160,6 +179,10 @@ async function getOrCreateWallet(jid) {
 
   if (data) {
     activeWalletRegistry.set(jid, data.address);
+    // Backfill a smart account for pre-existing users (background, non-blocking)
+    if (!data.account_address && !accountProvisioning.has(jid)) {
+      ensureAccount(jid, data.address).catch(() => {});
+    }
     return data;
   }
 
@@ -181,6 +204,84 @@ async function getSignerForJid(jid) {
   const row = await getOrCreateWallet(jid);
   const pk  = decrypt(row.encrypted_pk);
   return new ethers.Wallet(pk, provider);
+}
+
+// ── Smart-account helpers ──────────────────────────────────────
+// Read the user's SageAccount address from the DB (no on-chain tx). Returns
+// null if not provisioned yet — callers fall back to the legacy EOA path.
+async function getAccountAddress(jid) {
+  try {
+    const { data } = await supabase.from('rh_wallets').select('account_address').eq('jid', jid).single();
+    return data?.account_address || null;
+  } catch { return null; }
+}
+
+const accountProvisioning = new Set(); // jid guard against concurrent creation
+
+// Provision a SageAccount for a user if missing. Gas is paid by the deployer
+// wallet (not the user), so this works at onboarding before the user has ETH.
+// Returns the account address, or null if provisioning is unavailable/failed.
+async function ensureAccount(jid, eoaAddress) {
+  if (!SAGE_ACCOUNT_FACTORY || !DEX || !KEEPER_PK) return null;
+
+  const existing = await getAccountAddress(jid);
+  if (existing) return existing;
+  if (accountProvisioning.has(jid)) return null; // already in flight
+  accountProvisioning.add(jid);
+  try {
+    const deployer = new ethers.Wallet(KEEPER_PK, provider);
+    const factory  = new ethers.Contract(SAGE_ACCOUNT_FACTORY, ACCOUNT_FACTORY_ABI, deployer);
+    const userId   = userIdFor(jid);
+
+    // May already exist on-chain (e.g. DB column added after creation)
+    let acct = await factory.accountOf(userId);
+    if (!acct || acct === ethers.ZeroAddress) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const tx = await factory.createAccount(userId, eoaAddress, eoaAddress);
+          await waitTx(tx);
+          break;
+        } catch (e) {
+          if (!/nonce|replacement|already known/i.test(e.message) || attempt === 2) throw e;
+          await new Promise(r => setTimeout(r, 1500)); // nonce race with keeper — retry
+        }
+      }
+      acct = await factory.accountOf(userId);
+    }
+    if (!acct || acct === ethers.ZeroAddress) return null;
+
+    await supabase.from('rh_wallets').update({ account_address: acct }).eq('jid', jid);
+    return acct;
+  } catch (e) {
+    console.error('[Account] ensure failed:', e.message);
+    return null;
+  } finally {
+    accountProvisioning.delete(jid);
+  }
+}
+
+// On-chain ERC-20 balance (raw bigint) for any address.
+async function tokenBalanceOf(tokenAddress, owner) {
+  const c = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  return c.balanceOf(owner);
+}
+
+// Combined holdings across the smart account + the gas EOA, merged by symbol.
+// Used during the migration window so legacy EOA funds still show and trade.
+async function getCombinedPortfolio(jid) {
+  const row = await getOrCreateWallet(jid);
+  const accountAddr = await getAccountAddress(jid);
+  const addresses = accountAddr ? [accountAddr, row.address] : [row.address];
+
+  const merged = {};
+  for (const addr of addresses) {
+    const holdings = await getPortfolio(addr);
+    for (const h of holdings) {
+      if (merged[h.symbol]) merged[h.symbol].amount += h.amount;
+      else merged[h.symbol] = { ...h };
+    }
+  }
+  return { address: row.address, accountAddress: accountAddr, holdings: Object.values(merged) };
 }
 
 async function getPortfolio(address) {
@@ -224,9 +325,24 @@ async function sendToken(jid, symbol, toAddress, amount) {
   if (!tokenInfo) throw new Error(`Unknown token: ${symbol}`);
   if (tokenInfo.address === 'native') return sendEth(jid, toAddress, amount);
 
-  const signer   = await getSignerForJid(jid);
+  const signer = await getSignerForJid(jid);
+  const units  = ethers.parseUnits(String(amount), tokenInfo.decimals);
+
+  // If the smart account holds the tokens, withdraw via the account (owner=EOA
+  // signs). Otherwise transfer directly from the EOA (legacy/un-migrated funds).
+  const accountAddr = await getAccountAddress(jid);
+  if (accountAddr) {
+    try {
+      if ((await tokenBalanceOf(tokenInfo.address, accountAddr)) >= units) {
+        const account = new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, signer);
+        const tx = await account.withdraw(tokenInfo.address, toAddress, units);
+        await waitTx(tx);
+        return tx.hash;
+      }
+    } catch (e) { console.error('[Send] account withdraw failed, trying EOA:', e.message); }
+  }
+
   const contract = new ethers.Contract(tokenInfo.address, ERC20_ABI, signer);
-  const units    = ethers.parseUnits(String(amount), tokenInfo.decimals);
   const tx = await contract.transfer(toAddress, units);
   await waitTx(tx);
   return tx.hash;
@@ -268,23 +384,38 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
   if (!toToken   || toToken.address === 'native')   throw new Error(`Unsupported output token: ${toSymbol}`);
 
   const signer  = await getSignerForJid(jid);
-  const erc20   = new ethers.Contract(fromToken.address, ERC20_ABI, signer);
-  const router  = new ethers.Contract(DEX.router, ROUTER_ABI, signer);
 
   const amtIn     = ethers.parseUnits(String(amountIn), fromToken.decimals);
   const amtOutMin = ethers.parseUnits(String(minAmountOut), toToken.decimals);
   const path      = [fromToken.address, toToken.address];
   const deadline  = Math.floor(Date.now() / 1000) + 300;
 
-  // Check allowance and approve if needed
-  const allowance = await erc20.allowance(signer.address, DEX.router);
-  if (allowance < amtIn) {
-    const approveTx = await erc20.approve(DEX.router, amtIn);
-    await waitTx(approveTx);
+  // Route through the smart account when it holds the input token; otherwise
+  // fall back to the legacy EOA path (existing/un-migrated funds).
+  const accountAddr = await getAccountAddress(jid);
+  let useAccount = false;
+  if (accountAddr) {
+    try { useAccount = (await tokenBalanceOf(fromToken.address, accountAddr)) >= amtIn; } catch {}
   }
 
-  const tx = await router.swapExactTokensForTokens(amtIn, amtOutMin, path, signer.address, deadline);
-  const receipt = await waitTx(tx);
+  let tx, receipt;
+  if (useAccount) {
+    // account.swap() approves the router internally and forces output back to
+    // the account — funds can never leave via this path.
+    const account = new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, signer);
+    tx = await account.swap(amtIn, amtOutMin, path, deadline);
+    receipt = await waitTx(tx);
+  } else {
+    const erc20  = new ethers.Contract(fromToken.address, ERC20_ABI, signer);
+    const router = new ethers.Contract(DEX.router, ROUTER_ABI, signer);
+    const allowance = await erc20.allowance(signer.address, DEX.router);
+    if (allowance < amtIn) {
+      const approveTx = await erc20.approve(DEX.router, amtIn);
+      await waitTx(approveTx);
+    }
+    tx = await router.swapExactTokensForTokens(amtIn, amtOutMin, path, signer.address, deadline);
+    receipt = await waitTx(tx);
+  }
 
   // Parse actual amountOut from the last Transfer log
   const actualAmountOut = (() => {
@@ -639,12 +770,23 @@ async function executeTool(name, input, jid) {
   try {
     if (name === 'get_wallet') {
       const row = await getOrCreateWallet(jid);
+      let accountAddr = await getAccountAddress(jid);
+      if (!accountAddr) accountAddr = await ensureAccount(jid, row.address); // provision on demand
+      if (accountAddr) {
+        return {
+          smartAccount: accountAddr,   // deposit USDG/stocks here; on-chain Risk Guard
+          gasAddress:   row.address,   // fund this with testnet ETH for gas
+          chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID,
+          note: 'Deposit USDG and stocks to smartAccount. Fund gasAddress with testnet ETH for gas.',
+        };
+      }
       return { address: row.address, chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID };
     }
 
     if (name === 'get_portfolio') {
-      const row      = await getOrCreateWallet(jid);
-      const holdings = await getPortfolio(row.address);
+      const combined = await getCombinedPortfolio(jid); // smart account + gas EOA
+      const row      = { address: combined.address };
+      const holdings = combined.holdings;
       if (!holdings.length) return { holdings: [], message: 'Wallet is empty. Get testnet ETH from https://faucet.testnet.chain.robinhood.com/' };
 
       // Enrich with PNL for stock holdings
@@ -771,8 +913,7 @@ async function executeTool(name, input, jid) {
 
         // ── 3. Portfolio concentration ──────────────────────────────
         try {
-          const row      = await getOrCreateWallet(jid);
-          const holdings = await getPortfolio(row.address);
+          const holdings = (await getCombinedPortfolio(jid)).holdings;
           let portfolioUsdg = 0;
           for (const h of holdings) {
             if (h.symbol === 'USDG') { portfolioUsdg += h.amount; continue; }
@@ -852,12 +993,15 @@ async function executeTool(name, input, jid) {
       const fromSym = action === 'buy' ? 'USDG' : sym;
       const toSym   = action === 'buy' ? sym : 'USDG';
 
-      // Verify funds exist now — the order auto-executes later with no further checks
+      // Verify funds exist now — the order auto-executes later with no further checks.
+      // Count both the smart account and the gas EOA (migration window).
       try {
         const row = await getOrCreateWallet(jid);
-        const checkSym  = fromSym;
-        const contract  = new ethers.Contract(TOKENS[checkSym].address, ERC20_ABI, provider);
-        const bal = parseFloat(ethers.formatUnits(await contract.balanceOf(row.address), TOKENS[checkSym].decimals));
+        const checkSym = fromSym;
+        const accountAddr = await getAccountAddress(jid);
+        let raw = await tokenBalanceOf(TOKENS[checkSym].address, row.address);
+        if (accountAddr) raw += await tokenBalanceOf(TOKENS[checkSym].address, accountAddr);
+        const bal = parseFloat(ethers.formatUnits(raw, TOKENS[checkSym].decimals));
         if (bal < amount) {
           return {
             success: false,
@@ -949,8 +1093,8 @@ async function executeTool(name, input, jid) {
       const row = await getOrCreateWallet(jid);
       return {
         faucetUrl: 'https://faucet.testnet.chain.robinhood.com/',
-        address: row.address,
-        message: `Paste your address at the faucet to get testnet ETH.`,
+        address: row.address, // gas EOA — testnet ETH for gas goes here
+        message: `Paste this gas address at the faucet to get testnet ETH for transaction fees.`,
       };
     }
 
@@ -1000,6 +1144,12 @@ NEVER GO SILENT:
 - Never return an empty response
 - If the user cancels, declines, or says anything like "no", "don't", "stop", "cancel", "never mind", "don't proceed", "don't swap" — always acknowledge it. Reply with something like "Got it, cancelled." or "Okay, no swap. Let me know if you change your mind." Never stay silent after a cancellation.
 - If the user says something you don't understand, ask them to clarify — never ignore the message
+
+SMART ACCOUNT (important):
+- Every user has an on-chain smart account that holds their USDG and stocks and enforces SAGE's Risk Guard on-chain — even SAGE cannot withdraw their funds out, only the user's key can.
+- Each user has TWO addresses: the smartAccount (where they DEPOSIT USDG and stocks) and the gasAddress (which needs testnet ETH to pay transaction fees).
+- When showing get_wallet results: tell them to deposit USDG/stocks to the *smartAccount*, and fund the *gasAddress* with testnet ETH from the faucet.
+- If asked "why two addresses": the smart account protects funds on-chain; the gas address just pays network fees. Keep it to one line.
 
 BALANCE / PORTFOLIO:
 - ALWAYS call get_portfolio when the user asks about their balance, holdings, or portfolio — no exceptions
@@ -1115,6 +1265,15 @@ async function handleMessage(jid, text) {
     const password_hash = `scrypt:${pwSalt}:${pwKey}`;
     await supabase.from('rh_wallets').update({ password_hash }).eq('jid', jid);
     onboardingState.set(jid, 'done');
+
+    // Provision the on-chain smart account (gas paid by SAGE, not the user)
+    const row = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
+    const eoa = row.data?.address;
+    const account = eoa ? await ensureAccount(jid, eoa) : null;
+
+    if (account) {
+      return `🔒 *Password set!*\n\nYou've got a *smart account* — an on-chain wallet where even SAGE can't move your funds out without your key.\n\n📥 *Deposit USDG & stocks here:*\n\`${account}\`\n\n⛽ *Fund gas here* (testnet ETH):\n\`${eoa}\`\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to start 🚀`;
+    }
     return `🔒 *Password set!*\n\nYour wallet is ready. Fund it with testnet ETH:\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to get started 🚀`;
   }
 
