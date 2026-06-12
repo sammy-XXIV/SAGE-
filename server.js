@@ -1344,7 +1344,7 @@ async function handleMessage(jid, text) {
       onboardingState.set(jid, 'done');
     } else {
       onboardingState.set(jid, 'awaiting_choice');
-      return `👋 Welcome to *SAGE* — your DeFi agent on Robinhood Chain.\n\nTrade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nTo get started, would you like to:\n\n*1️⃣ Generate a new wallet*\n*2️⃣ Import an existing wallet*\n\nReply *1* or *2*`;
+      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed — I'll set you up with a secure on-chain smart wallet.\n\nTo begin:\n*1️⃣ Create a new wallet* (recommended)\n*2️⃣ Import an existing wallet*\n\nReply *1* or *2*`;
     }
   }
 
@@ -1357,7 +1357,7 @@ async function handleMessage(jid, text) {
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
       onboardingState.set(jid, 'awaiting_password_set');
-      return `✅ *Wallet created!*\n\n📬 Address:\n\`${wallet.address}\`\n\nNow set a *password* to protect your wallet.\nYou'll need it to export your private key.\n\nReply with your chosen password:`;
+      return `✅ *Wallet created and encrypted.*\n\nNow set a *password* to protect it — you'll need it to export your key later.\n\nReply with your chosen password:`;
     } else if (choice === '2') {
       onboardingState.set(jid, 'awaiting_pk');
       return `🔑 Send your *private key* and I'll import your wallet.\n\n⚠️ It will be encrypted and stored securely. This message will be deleted immediately.`;
@@ -1375,7 +1375,7 @@ async function handleMessage(jid, text) {
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
       onboardingState.set(jid, 'awaiting_password_set');
-      return `✅ *Wallet imported!*\n\n📬 Address:\n\`${wallet.address}\`\n\nNow set a *password* to protect your wallet.\nYou'll need it to export your private key.\n\nReply with your chosen password:`;
+      return `✅ *Wallet imported and encrypted.*\n\nNow set a *password* to protect it — you'll need it to export your key later.\n\nReply with your chosen password:`;
     } catch {
       return `❌ Invalid private key. Please try again or reply *1* to generate a new wallet instead.`;
     }
@@ -1766,6 +1766,30 @@ app.get('/admin/keeper', async (req, res) => {
   try {
     await runPriceKeeper();
     res.json({ ok: true, message: 'Keeper run triggered' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Fully reset a user (demo helper) — clears in-memory state + all DB rows so the
+// next message restarts onboarding from scratch. DESTRUCTIVE: deletes the wallet
+// (and its encrypted key) — any funds in that wallet become unrecoverable.
+app.get('/admin/reset-user', async (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'unauthorized' });
+  const jid = req.query.jid;
+  if (!jid) return res.status(400).json({ error: 'jid query param required' });
+  try {
+    onboardingState.delete(jid);
+    historyCache.delete(jid);
+    activeWalletRegistry.delete(jid);
+    spendingLimits.delete(jid);
+    pendingLimitOrders.delete(jid);
+    exportIntentJids.delete(jid);
+    await supabase.from('rh_wallets').delete().eq('jid', jid);
+    await supabase.from('rh_conversation_history').delete().eq('jid', jid);
+    await supabase.from('rh_trades').delete().eq('jid', jid);
+    await supabase.from('rh_alerts').delete().eq('jid', jid);
+    res.json({ ok: true, jid, message: 'User reset — next message restarts onboarding.' });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
