@@ -685,14 +685,25 @@ async function executeTool(name, input, jid) {
       const { symbol, action, target_price, amount } = input;
       const sym = symbol.toUpperCase();
 
-      // Auto-detect condition from current price vs target
+      // Trust the AI's condition (parsed from user's words — "below", "above", "drops to", "rises to")
+      const condition = input.condition;
       const priceData = await getStockPrice(sym);
       const currentPrice = priceData ? priceData.price : null;
-      const condition = currentPrice !== null
-        ? (target_price > currentPrice ? 'above' : 'below')
-        : input.condition;
 
-      const dir = condition === 'above' ? 'rises to' : 'drops to';
+      // Warn if condition already satisfied — would fire immediately
+      if (currentPrice !== null) {
+        const alreadyMet =
+          (condition === 'above' && currentPrice >= target_price) ||
+          (condition === 'below' && currentPrice <= target_price);
+        if (alreadyMet) {
+          return {
+            success: false,
+            message: `⚠️ ${sym} is already $${currentPrice.toFixed(2)} — that's already ${condition} your target of $${target_price}. The order would fire immediately. Did you mean a different price?`,
+          };
+        }
+      }
+
+      const dir = condition === 'above' ? 'rises above' : 'drops below';
       const fromSym = action === 'buy' ? 'USDG' : sym;
       const toSym   = action === 'buy' ? sym : 'USDG';
 
