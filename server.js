@@ -260,6 +260,9 @@ const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.js
 
 // ── Per-user spending limits (in-memory, set via set_spending_limit tool) ──
 const spendingLimits = new Map(); // jid → max USDG per trade
+
+// ── Pending limit order confirmations ─────────────────────────
+const pendingLimitOrders = new Map(); // jid → alert row (waiting for user yes/no)
 const PAIR_ABI_PRICE = ['function getReserves() view returns (uint112,uint112,uint32)', 'function token0() view returns (address)'];
 
 async function getStockPrice(symbol) {
@@ -1051,6 +1054,42 @@ async function connectWhatsApp() {
       if (!text.trim()) continue;
 
       try {
+        // ── Limit order confirmation intercept ────────────────
+        if (pendingLimitOrders.has(jid)) {
+          const pending = pendingLimitOrders.get(jid);
+          const t = text.trim().toLowerCase();
+          const isYes = /^(yes|y|confirm|yep|yh|yeah|sure|ok|okay|do it|execute|go|proceed)$/i.test(t);
+          const isNo  = /^(no|n|nope|cancel|stop|nah|don't|dont|never mind|nevermind|skip)$/i.test(t);
+
+          if (isYes || isNo) {
+            pendingLimitOrders.delete(jid);
+            await waSocket.sendPresenceUpdate('composing', jid);
+            if (isNo) {
+              await sendWAMessage(jid, `Got it — limit order cancelled. Let me know if you want to set a new one.`);
+            } else {
+              // Execute
+              try {
+                const fromSym = pending.action === 'buy' ? 'USDG' : pending.symbol;
+                const toSym   = pending.action === 'buy' ? pending.symbol : 'USDG';
+                const quote   = await getSwapQuote(fromSym, toSym, Number(pending.amount));
+                if (quote.error) throw new Error(quote.error);
+                const minOut  = quote.amountOut * 0.99;
+                const result  = await executeSwap(jid, fromSym, toSym, Number(pending.amount), minOut);
+                if (result.error) throw new Error(result.error);
+                await sendWAMessage(jid,
+                  `✅ *Limit Order Executed*\n${pending.action.toUpperCase()} ${pending.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${pending.currentPrice.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
+                );
+              } catch (e) {
+                await sendWAMessage(jid, `⚠️ Limit order failed: ${e.message}`);
+              }
+            }
+            await waSocket.sendPresenceUpdate('paused', jid);
+            continue;
+          }
+          // User said something else — clear pending and fall through to Claude
+          pendingLimitOrders.delete(jid);
+        }
+
         const currentState = onboardingState.get(jid);
         const isPkMessage     = currentState === 'awaiting_pk';
         const isPasswordMsg   = currentState === 'awaiting_export_password';
@@ -1295,23 +1334,13 @@ async function runAlertMonitor() {
             `🔔 *Price Alert Triggered*\n${sym} is now $${price.toFixed(2)} — ${alert.condition} your target of $${alert.target_price}`
           );
         } else if (alert.type === 'limit') {
-          // Execute the limit order
-          try {
-            const fromSym = alert.action === 'buy' ? 'USDG' : sym;
-            const toSym   = alert.action === 'buy' ? sym : 'USDG';
-            const quote   = await getSwapQuote(fromSym, toSym, Number(alert.amount));
-            if (quote.error) throw new Error(quote.error);
-            const minOut  = quote.amountOut * 0.99;
-            const result  = await executeSwap(alert.jid, fromSym, toSym, Number(alert.amount), minOut);
-            if (result.error) throw new Error(result.error);
-            await sendWAMessage(alert.jid,
-              `✅ *Limit Order Executed*\n${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${price.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
-            );
-          } catch (e) {
-            await sendWAMessage(alert.jid,
-              `⚠️ *Limit Order Failed*\n${sym} hit $${price.toFixed(2)} but order failed: ${e.message}`
-            );
-          }
+          // Ask for confirmation before executing — never auto-execute without user approval
+          const fromSym = alert.action === 'buy' ? 'USDG' : sym;
+          const toSym   = alert.action === 'buy' ? sym : 'USDG';
+          pendingLimitOrders.set(alert.jid, { ...alert, currentPrice: price });
+          await sendWAMessage(alert.jid,
+            `🔔 *Limit Order Ready*\n\n${sym} is now $${price.toFixed(2)} — your target of $${alert.target_price} was hit.\n\nShould I ${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${toSym} now?\n\nReply *Yes* to confirm or *No* to cancel.`
+          );
         }
 
         // Mark triggered
