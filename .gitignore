@@ -6,3 +6,9 @@ artifacts/
 cache/
 ui/
 *.log
+.env
+
+# Internal submission/pitch copy — keep local, never push
+SUBMISSION.md
+SUBMISSION.local.md
+*.local.md
