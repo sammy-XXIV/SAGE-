@@ -261,8 +261,8 @@ const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.js
 // ── Per-user spending limits (in-memory, set via set_spending_limit tool) ──
 const spendingLimits = new Map(); // jid → max USDG per trade
 
-// ── Pending limit order confirmations ─────────────────────────
-const pendingLimitOrders = new Map(); // jid → alert row (waiting for user yes/no)
+// ── Pending limit order setup confirmations (confirm at order placement, not execution) ──
+const pendingLimitOrders = new Map(); // jid → order details (waiting for yes/no before saving to DB)
 const PAIR_ABI_PRICE = ['function getReserves() view returns (uint112,uint112,uint32)', 'function token0() view returns (address)'];
 
 async function getStockPrice(symbol) {
@@ -669,23 +669,25 @@ async function executeTool(name, input, jid) {
       const { symbol, action, target_price, amount } = input;
       const sym = symbol.toUpperCase();
 
-      // Auto-detect condition from current price vs target — don't trust AI's condition field
+      // Auto-detect condition from current price vs target
       const priceData = await getStockPrice(sym);
       const currentPrice = priceData ? priceData.price : null;
-      let condition;
-      if (currentPrice !== null) {
-        condition = target_price > currentPrice ? 'above' : 'below';
-      } else {
-        // fallback to AI-provided condition if price fetch fails
-        condition = input.condition;
-      }
+      const condition = currentPrice !== null
+        ? (target_price > currentPrice ? 'above' : 'below')
+        : input.condition;
 
-      const { error } = await supabase.from('rh_alerts').insert({
-        jid, type: 'limit', symbol: sym, condition, target_price, action, amount,
-      });
-      if (error) return { error: error.message };
       const dir = condition === 'above' ? 'rises to' : 'drops to';
-      return { success: true, message: `Limit order set: ${action} ${amount} ${action === 'buy' ? 'USDG of' : ''} ${sym} when price ${dir} $${target_price}${currentPrice ? ` (currently $${currentPrice.toFixed(2)})` : ''}` };
+      const fromSym = action === 'buy' ? 'USDG' : sym;
+      const toSym   = action === 'buy' ? sym : 'USDG';
+
+      // Store pending — don't save to DB until user confirms
+      pendingLimitOrders.set(jid, { sym, action, condition, target_price, amount, fromSym, toSym });
+
+      return {
+        success: true,
+        needs_confirmation: true,
+        message: `Limit order ready — I'll auto-${action} ${amount} ${fromSym} → ${toSym} when ${sym} ${dir} $${target_price}${currentPrice ? ` (now $${currentPrice.toFixed(2)})` : ''}. Confirm?`,
+      };
     }
 
     if (name === 'get_trade_history') {
@@ -1054,33 +1056,36 @@ async function connectWhatsApp() {
       if (!text.trim()) continue;
 
       try {
-        // ── Limit order confirmation intercept ────────────────
+        // ── Limit order placement confirmation intercept ──────
         if (pendingLimitOrders.has(jid)) {
           const pending = pendingLimitOrders.get(jid);
           const t = text.trim().toLowerCase();
-          const isYes = /^(yes|y|confirm|yep|yh|yeah|sure|ok|okay|do it|execute|go|proceed)$/i.test(t);
+          const isYes = /^(yes|y|confirm|yep|yh|yeah|sure|ok|okay|do it|go|proceed)$/i.test(t);
           const isNo  = /^(no|n|nope|cancel|stop|nah|don't|dont|never mind|nevermind|skip)$/i.test(t);
 
           if (isYes || isNo) {
             pendingLimitOrders.delete(jid);
             await waSocket.sendPresenceUpdate('composing', jid);
             if (isNo) {
-              await sendWAMessage(jid, `Got it — limit order cancelled. Let me know if you want to set a new one.`);
+              await sendWAMessage(jid, `Got it — limit order cancelled.`);
             } else {
-              // Execute
-              try {
-                const fromSym = pending.action === 'buy' ? 'USDG' : pending.symbol;
-                const toSym   = pending.action === 'buy' ? pending.symbol : 'USDG';
-                const quote   = await getSwapQuote(fromSym, toSym, Number(pending.amount));
-                if (quote.error) throw new Error(quote.error);
-                const minOut  = quote.amountOut * 0.99;
-                const result  = await executeSwap(jid, fromSym, toSym, Number(pending.amount), minOut);
-                if (result.error) throw new Error(result.error);
+              // Save to DB — will auto-execute when price hits, no further confirmation needed
+              const { error } = await supabase.from('rh_alerts').insert({
+                jid,
+                type: 'limit',
+                symbol: pending.sym,
+                condition: pending.condition,
+                target_price: pending.target_price,
+                action: pending.action,
+                amount: pending.amount,
+              });
+              if (error) {
+                await sendWAMessage(jid, `⚠️ Failed to save limit order: ${error.message}`);
+              } else {
+                const dir = pending.condition === 'above' ? 'rises to' : 'drops to';
                 await sendWAMessage(jid,
-                  `✅ *Limit Order Executed*\n${pending.action.toUpperCase()} ${pending.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${pending.currentPrice.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
+                  `✅ Limit order set — I'll automatically ${pending.action} ${pending.amount} ${pending.fromSym} → ${pending.toSym} when ${pending.sym} ${dir} $${pending.target_price}. I'll notify you when it executes.`
                 );
-              } catch (e) {
-                await sendWAMessage(jid, `⚠️ Limit order failed: ${e.message}`);
               }
             }
             await waSocket.sendPresenceUpdate('paused', jid);
@@ -1334,13 +1339,23 @@ async function runAlertMonitor() {
             `🔔 *Price Alert Triggered*\n${sym} is now $${price.toFixed(2)} — ${alert.condition} your target of $${alert.target_price}`
           );
         } else if (alert.type === 'limit') {
-          // Ask for confirmation before executing — never auto-execute without user approval
-          const fromSym = alert.action === 'buy' ? 'USDG' : sym;
-          const toSym   = alert.action === 'buy' ? sym : 'USDG';
-          pendingLimitOrders.set(alert.jid, { ...alert, currentPrice: price });
-          await sendWAMessage(alert.jid,
-            `🔔 *Limit Order Ready*\n\n${sym} is now $${price.toFixed(2)} — your target of $${alert.target_price} was hit.\n\nShould I ${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${toSym} now?\n\nReply *Yes* to confirm or *No* to cancel.`
-          );
+          // Auto-execute — user already confirmed when placing the order
+          try {
+            const fromSym = alert.action === 'buy' ? 'USDG' : sym;
+            const toSym   = alert.action === 'buy' ? sym : 'USDG';
+            const quote   = await getSwapQuote(fromSym, toSym, Number(alert.amount));
+            if (quote.error) throw new Error(quote.error);
+            const minOut  = quote.amountOut * 0.99;
+            const result  = await executeSwap(alert.jid, fromSym, toSym, Number(alert.amount), minOut);
+            if (result.error) throw new Error(result.error);
+            await sendWAMessage(alert.jid,
+              `✅ *Limit Order Executed*\n${alert.action.toUpperCase()} ${alert.amount} ${fromSym} → ${result.amountOut?.toFixed(4) || '?'} ${toSym}\nPrice: $${price.toFixed(2)}\nTx: https://explorer.testnet.chain.robinhood.com/tx/${result.hash}`
+            );
+          } catch (e) {
+            await sendWAMessage(alert.jid,
+              `⚠️ *Limit Order Failed*\n${sym} hit $${price.toFixed(2)} but execution failed: ${e.message}`
+            );
+          }
         }
 
         // Mark triggered
