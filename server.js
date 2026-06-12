@@ -1150,7 +1150,7 @@ async function connectWhatsApp() {
               if (error) {
                 await sendWAMessage(jid, `⚠️ Failed to save limit order: ${error.message}`);
               } else {
-                const dir = pending.condition === 'above' ? 'rises to' : 'drops to';
+                const dir = pending.condition === 'above' ? 'rises above' : 'drops below';
                 await sendWAMessage(jid,
                   `✅ Limit order set — I'll automatically ${pending.action} ${pending.amount} ${pending.fromSym} → ${pending.toSym} when ${pending.sym} ${dir} $${pending.target_price}. I'll notify you when it executes.`
                 );
