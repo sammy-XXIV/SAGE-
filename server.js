@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 import Pino from 'pino';
 import Anthropic from '@anthropic-ai/sdk';
@@ -17,10 +18,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 app.use(express.json());
 
+// ── Rate limiting ─────────────────────────────────────────────
+const generalLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+const adminLimiter   = rateLimit({ windowMs: 60_000, max: 10, standardHeaders: true, legacyHeaders: false });
+app.use('/admin', adminLimiter);
+app.use(generalLimiter);
+
 // ── Config ────────────────────────────────────────────────────
 const RPC_URL        = process.env.RPC_URL || 'https://rpc.testnet.chain.robinhood.com';
 const CHAIN_ID       = 46630;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'sage-rh-default-key-32-chars!!!!!';
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY) throw new Error('ENCRYPTION_KEY env var is required — refusing to start without it');
 
 const provider  = new ethers.JsonRpcProvider(RPC_URL, { chainId: CHAIN_ID, name: 'robinhood-testnet' });
 const supabase  = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_KEY || '');
@@ -64,17 +72,32 @@ try {
 }
 
 // ── Encryption ─────────────────────────────────────────────────
+// New format: salt_hex:iv_hex:ciphertext  (random per-wallet salt)
+// Old format: iv_hex:ciphertext           (static salt — legacy, read-only)
 function encrypt(text) {
-  const iv  = crypto.randomBytes(16);
-  const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
+  const salt   = crypto.randomBytes(16);
+  const iv     = crypto.randomBytes(16);
+  const key    = crypto.scryptSync(ENCRYPTION_KEY, salt, 32);
   const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-  return iv.toString('hex') + ':' + cipher.update(text, 'utf8', 'hex') + cipher.final('hex');
+  return salt.toString('hex') + ':' + iv.toString('hex') + ':' + cipher.update(text, 'utf8', 'hex') + cipher.final('hex');
 }
 
 function decrypt(enc) {
-  const [ivHex, data] = enc.split(':');
-  const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
-  const decipher = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(ivHex, 'hex'));
+  const parts = enc.split(':');
+  let key, iv, data;
+  if (parts.length === 3) {
+    const [saltHex, ivHex, ciphertext] = parts;
+    key  = crypto.scryptSync(ENCRYPTION_KEY, Buffer.from(saltHex, 'hex'), 32);
+    iv   = Buffer.from(ivHex, 'hex');
+    data = ciphertext;
+  } else {
+    // Legacy: static salt
+    const [ivHex, ciphertext] = parts;
+    key  = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
+    iv   = Buffer.from(ivHex, 'hex');
+    data = ciphertext;
+  }
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
   return decipher.update(data, 'hex', 'utf8') + decipher.final('utf8');
 }
 
@@ -143,7 +166,7 @@ async function sendEth(jid, toAddress, amount) {
   const signer = await getSignerForJid(jid);
   const value  = ethers.parseEther(String(amount));
   const tx = await signer.sendTransaction({ to: toAddress, value });
-  await tx.wait();
+  await waitTx(tx);
   return tx.hash;
 }
 
@@ -156,7 +179,7 @@ async function sendToken(jid, symbol, toAddress, amount) {
   const contract = new ethers.Contract(tokenInfo.address, ERC20_ABI, signer);
   const units    = ethers.parseUnits(String(amount), tokenInfo.decimals);
   const tx = await contract.transfer(toAddress, units);
-  await tx.wait();
+  await waitTx(tx);
   return tx.hash;
 }
 
@@ -208,11 +231,11 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
   const allowance = await erc20.allowance(signer.address, DEX.router);
   if (allowance < amtIn) {
     const approveTx = await erc20.approve(DEX.router, amtIn);
-    await approveTx.wait();
+    await waitTx(approveTx);
   }
 
   const tx = await router.swapExactTokensForTokens(amtIn, amtOutMin, path, signer.address, deadline);
-  const receipt = await tx.wait();
+  const receipt = await waitTx(tx);
 
   // Parse actual amountOut from the last Transfer log
   const actualAmountOut = (() => {
@@ -263,6 +286,24 @@ const spendingLimits = new Map(); // jid → max USDG per trade
 
 // ── Pending limit order setup confirmations (confirm at order placement, not execution) ──
 const pendingLimitOrders = new Map(); // jid → order details (waiting for yes/no before saving to DB)
+
+// ── Server-side risk-guard override tracking ──────────────────
+// Only allow force=true on execute_swap if a risk guard actually blocked for this jid recently.
+// Prevents Claude from self-granting force bypass via prompt injection.
+const riskOverrides = new Map(); // jid → expires (ms timestamp)
+
+// ── Export intent tracking ────────────────────────────────────
+// Prevents __TRIGGER_EXPORT__ from firing unless user explicitly asked for it
+const exportIntentJids = new Set();
+
+// ── tx.wait() timeout wrapper ─────────────────────────────────
+function waitTx(tx, ms = 60_000) {
+  return Promise.race([
+    tx.wait(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Transaction timed out after 60s')), ms)),
+  ]);
+}
+
 const PAIR_ABI_PRICE = ['function getReserves() view returns (uint112,uint112,uint32)', 'function token0() view returns (address)'];
 
 async function getStockPrice(symbol) {
@@ -582,7 +623,13 @@ async function executeTool(name, input, jid) {
       const fromSym = input.from_symbol.toUpperCase();
       const toSym   = input.to_symbol.toUpperCase();
       const amtIn   = parseFloat(input.amount_in);
-      const force   = !!input.force;
+
+      // force=true is only honored if a risk guard blocked for this user recently (server-side).
+      // This prevents Claude from self-granting force bypass via prompt injection.
+      const requestedForce = !!input.force;
+      const override = riskOverrides.get(jid);
+      const force = requestedForce && !!override && Date.now() < override;
+      if (force) riskOverrides.delete(jid);
 
       if (!force) {
         // ── 1. Spending limit ───────────────────────────────────────
@@ -591,9 +638,11 @@ async function executeTool(name, input, jid) {
           let tradeValueUsdg = amtIn;
           if (fromSym !== 'USDG') {
             const p = await getStockPrice(fromSym);
-            tradeValueUsdg = p ? p.price * amtIn : amtIn;
+            if (!p) return { blocked: true, reason: 'spending_limit', message: '🛡️ *SAGE Risk Guard*: could not verify trade value — price fetch failed. Please try again.' };
+            tradeValueUsdg = p.price * amtIn;
           }
           if (tradeValueUsdg > limit) {
+            riskOverrides.set(jid, Date.now() + 5 * 60_000);
             return {
               blocked: true,
               reason: 'spending_limit',
@@ -627,6 +676,7 @@ async function executeTool(name, input, jid) {
             }
 
             if (impact > 8) {
+              riskOverrides.set(jid, Date.now() + 5 * 60_000);
               return {
                 blocked: true,
                 reason: 'price_impact',
@@ -656,6 +706,7 @@ async function executeTool(name, input, jid) {
           }
           const pct = portfolioUsdg > 0 ? (tradeUsdg / portfolioUsdg * 100) : 0;
           if (pct > 25) {
+            riskOverrides.set(jid, Date.now() + 5 * 60_000);
             return {
               blocked: true,
               reason: 'concentration',
@@ -952,7 +1003,9 @@ async function handleMessage(jid, text) {
   if (state === 'awaiting_password_set') {
     const password = text.trim();
     if (password.length < 6) return `❌ Password too short. Use at least 6 characters.`;
-    const password_hash = crypto.createHash('sha256').update(password).digest('hex');
+    const pwSalt = crypto.randomBytes(16).toString('hex');
+    const pwKey  = crypto.scryptSync(password, pwSalt, 32).toString('hex');
+    const password_hash = `scrypt:${pwSalt}:${pwKey}`;
     await supabase.from('rh_wallets').update({ password_hash }).eq('jid', jid);
     onboardingState.set(jid, 'done');
     return `🔒 *Password set!*\n\nYour wallet is ready. Fund it with testnet ETH:\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to get started 🚀`;
@@ -961,8 +1014,15 @@ async function handleMessage(jid, text) {
   // ── Export private key: waiting for password ──────────────────
   if (state === 'awaiting_export_password') {
     const { data: row } = await supabase.from('rh_wallets').select('encrypted_pk, password_hash').eq('jid', jid).single();
-    const entered_hash = crypto.createHash('sha256').update(text.trim()).digest('hex');
-    if (entered_hash !== row.password_hash) {
+    let passwordMatch = false;
+    if (row.password_hash?.startsWith('scrypt:')) {
+      const [, saltHex, storedKey] = row.password_hash.split(':');
+      passwordMatch = crypto.scryptSync(text.trim(), saltHex, 32).toString('hex') === storedKey;
+    } else {
+      // Legacy SHA256 — still works for existing users
+      passwordMatch = crypto.createHash('sha256').update(text.trim()).digest('hex') === row.password_hash;
+    }
+    if (!passwordMatch) {
       onboardingState.set(jid, 'done');
       return `❌ Wrong password. Export cancelled.`;
     }
@@ -970,6 +1030,14 @@ async function handleMessage(jid, text) {
     onboardingState.set(jid, 'done');
     // Return special marker — message handler will send + schedule deletion
     return `__EXPORT_PK__${pk}`;
+  }
+
+  // ── Export private key: detect intent server-side (before Claude) ────
+  const EXPORT_RE = /\b(export|show|give me|reveal|display|get)\b.{0,30}\b(private\s?key|pk)\b/i;
+  if (EXPORT_RE.test(text)) {
+    exportIntentJids.add(jid);
+    onboardingState.set(jid, 'awaiting_export_password');
+    return `🔒 Enter your *password* to export your private key:`;
   }
 
   // ── Normal AI flow (onboarding done) ─────────────────────────
@@ -1020,12 +1088,18 @@ async function useSupabaseAuthState() {
     const { data, error } = await supabase.from('wa_sessions').select('data').eq('key_id', keyId).single();
     if (error && error.code !== 'PGRST116') console.error('[WA-AUTH] read error:', error.message);
     if (!data) return null;
-    return JSON.parse(data.data, BufferJSON.reviver);
+    // Try decrypt (new encrypted format), fall back to plain JSON (legacy)
+    try {
+      return JSON.parse(decrypt(data.data), BufferJSON.reviver);
+    } catch {
+      try { return JSON.parse(data.data, BufferJSON.reviver); } catch { return null; }
+    }
   }
 
   async function write(keyId, value) {
+    const encrypted = encrypt(JSON.stringify(value, BufferJSON.replacer));
     const { error } = await supabase.from('wa_sessions').upsert(
-      { key_id: keyId, data: JSON.stringify(value, BufferJSON.replacer), updated_at: new Date().toISOString() },
+      { key_id: keyId, data: encrypted, updated_at: new Date().toISOString() },
       { onConflict: 'key_id' }
     );
     if (error) console.error('[WA-AUTH] write error:', error.message);
@@ -1204,8 +1278,9 @@ async function connectWhatsApp() {
           await waSocket.sendMessage(jid, { image: buffer, caption });
         }
 
-        // Claude triggered export flow
-        if (reply.trim() === '__TRIGGER_EXPORT__') {
+        // Claude triggered export flow — only honor if user genuinely requested it server-side
+        if (reply.trim() === '__TRIGGER_EXPORT__' && exportIntentJids.has(jid)) {
+          exportIntentJids.delete(jid);
           onboardingState.set(jid, 'awaiting_export_password');
           await waSocket.sendMessage(jid, { text: `🔒 Enter your *password* to export your private key:` });
           continue;
@@ -1237,6 +1312,7 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/wallet/:jid', async (req, res) => {
+  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ ok: false, error: 'unauthorized' });
   try {
     const row = await getOrCreateWallet(req.params.jid);
     res.json({ ok: true, address: row.address });
@@ -1297,7 +1373,7 @@ app.get('/admin/keeper', async (req, res) => {
 });
 
 app.get('/prices', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
   const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
   const result = {};
   await Promise.all(syms.map(async sym => {
@@ -1389,10 +1465,10 @@ async function _runPriceKeeper() {
       if (bal < parsed) { console.log(`[Keeper] ${sym}: insufficient balance`); continue; }
 
       const allowance = await erc20.allowance(keeper.address, DEX.router);
-      if (allowance < parsed) await (await erc20.approve(DEX.router, parsed)).wait();
+      if (allowance < parsed) await waitTx(await erc20.approve(DEX.router, parsed));
 
       const tx = await router.swapExactTokensForTokens(parsed, 0, [tokenIn.address, tokenOut.address], keeper.address, Math.floor(Date.now()/1000)+120);
-      await tx.wait();
+      await waitTx(tx);
       console.log(`[Keeper] ${sym} rebalanced — ${tx.hash.slice(0,18)}…`);
     } catch (e) {
       console.error(`[Keeper] ${sym} error:`, e.message);
@@ -1403,7 +1479,7 @@ async function _runPriceKeeper() {
   try {
     const oracle = new ethers.Contract(SAGE_ORACLE_ADDRESS, SAGE_ORACLE_ABI, keeper);
     const tx = await oracle.updateAll();
-    await tx.wait();
+    await waitTx(tx);
     console.log(`[Keeper] SageOracle updated — ${tx.hash.slice(0,18)}…`);
   } catch (e) {
     console.error('[Keeper] SageOracle updateAll error:', e.message);
