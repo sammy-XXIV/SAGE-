@@ -480,6 +480,22 @@ const sageTools = [
     },
   },
   {
+    name: 'get_orders',
+    description: 'Fetch all active (untriggered) limit orders and price alerts for the user.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'cancel_order',
+    description: 'Cancel an active limit order or price alert by its ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'The order/alert ID to cancel' },
+      },
+      required: ['id'],
+    },
+  },
+  {
     name: 'get_faucet',
     description: 'Get faucet link for testnet ETH on Robinhood Chain, plus the user\'s wallet address for easy copy-paste.',
     input_schema: { type: 'object', properties: {}, required: [] },
@@ -690,6 +706,41 @@ async function executeTool(name, input, jid) {
       };
     }
 
+    if (name === 'get_orders') {
+      const { data, error } = await supabase
+        .from('rh_alerts')
+        .select('*')
+        .eq('jid', jid)
+        .eq('triggered', false)
+        .order('created_at', { ascending: false });
+      if (error) return { error: error.message };
+      if (!data || data.length === 0) return { orders: [], message: 'No active orders or alerts.' };
+      return {
+        orders: data.map(o => ({
+          id: o.id,
+          type: o.type,
+          symbol: o.symbol,
+          condition: o.condition,
+          target_price: o.target_price,
+          ...(o.type === 'limit' ? { action: o.action, amount: o.amount } : {}),
+          created_at: o.created_at,
+        })),
+      };
+    }
+
+    if (name === 'cancel_order') {
+      const { data, error: fetchErr } = await supabase
+        .from('rh_alerts')
+        .select('id, jid')
+        .eq('id', input.id)
+        .single();
+      if (fetchErr || !data) return { error: 'Order not found.' };
+      if (data.jid !== jid) return { error: 'That order does not belong to you.' };
+      const { error } = await supabase.from('rh_alerts').delete().eq('id', input.id);
+      if (error) return { error: error.message };
+      return { success: true, message: `Order #${input.id} cancelled.` };
+    }
+
     if (name === 'get_trade_history') {
       const limit = Math.min(input.limit || 10, 50);
       const { data, error } = await supabase
@@ -805,6 +856,12 @@ LIMIT ORDERS:
 - When user says "buy $X USDG of TSLA if it drops to $Y": call set_limit_order with action=buy, condition=below
 - When user says "sell N TSLA if it hits $Y": call set_limit_order with action=sell, condition=above
 - Confirm the order details and note it will auto-execute
+
+ORDERS & ALERTS:
+- When user asks "what are my orders?", "show my alerts", "bring up existing orders", "list my limit orders" etc: call get_orders
+- Format each order: "#ID · LIMIT · BUY 10 USDG → NFLX when price drops below $400"
+- When user asks to cancel an order: call cancel_order with the ID. Confirm cancellation.
+- NEVER make up or recall orders from memory — always call get_orders
 
 TRADE HISTORY:
 - When user asks for trade history or "what have I traded?": call get_trade_history
