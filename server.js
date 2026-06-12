@@ -1189,6 +1189,16 @@ app.get('/price/:symbol', async (req, res) => {
   }
 });
 
+app.get('/admin/keeper', async (req, res) => {
+  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    await runPriceKeeper();
+    res.json({ ok: true, message: 'Keeper run triggered' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get('/prices', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
@@ -1270,9 +1280,9 @@ async function _runPriceKeeper() {
 
       let tokenIn, tokenOut, amountIn, decimalsIn;
       if (deltaUSDG > 0) {
-        tokenIn = TOKENS.USDG; tokenOut = TOKENS[sym]; amountIn = Math.min(deltaUSDG / 0.997, 20); decimalsIn = 6;
+        tokenIn = TOKENS.USDG; tokenOut = TOKENS[sym]; amountIn = Math.min(deltaUSDG / 0.997, 500); decimalsIn = 6;
       } else {
-        tokenIn = TOKENS[sym]; tokenOut = TOKENS.USDG; amountIn = Math.min(Math.abs(rSTOCK_new - dex.rSTOCK) / 0.997, 0.5); decimalsIn = 18;
+        tokenIn = TOKENS[sym]; tokenOut = TOKENS.USDG; amountIn = Math.min(Math.abs(rSTOCK_new - dex.rSTOCK) / 0.997, 10); decimalsIn = 18;
       }
       if (amountIn < 0.000001) continue;
 
