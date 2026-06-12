@@ -251,12 +251,56 @@ async function ensureAccount(jid, eoaAddress) {
     if (!acct || acct === ethers.ZeroAddress) return null;
 
     await supabase.from('rh_wallets').update({ account_address: acct }).eq('jid', jid);
+    await sponsorGas(eoaAddress); // pre-fund gas so the user never needs ETH
     return acct;
   } catch (e) {
     console.error('[Account] ensure failed:', e.message);
     return null;
   } finally {
     accountProvisioning.delete(jid);
+  }
+}
+
+// ── Gas sponsorship ────────────────────────────────────────────
+// SAGE covers gas for every user so they only deal with ONE address (the
+// smart account). Each user's EOA still signs its own swaps (own nonce, no
+// shared key), we just keep it topped up from the deployer wallet.
+// Gas is ~0.000002 ETH/swap on Robinhood Chain (0.01 gwei), so tiny top-ups go
+// a long way. Refill an EOA to ~150 swaps' worth when it drops below ~15.
+const GAS_TOPUP_THRESHOLD = ethers.parseEther('0.00003'); // ~15 swaps left → refill
+const GAS_TOPUP_AMOUNT    = ethers.parseEther('0.0003');  // ~150 swaps
+const GAS_RESERVE         = ethers.parseEther('0.0003');  // keep this much in deployer for the keeper
+const gasSponsoring = new Set(); // eoa guard against concurrent top-ups
+
+async function sponsorGas(eoaAddress) {
+  if (!KEEPER_PK || !eoaAddress) return;
+  try {
+    if ((await provider.getBalance(eoaAddress)) >= GAS_TOPUP_THRESHOLD) return;
+    if (gasSponsoring.has(eoaAddress)) return;
+    gasSponsoring.add(eoaAddress);
+    try {
+      const deployer = new ethers.Wallet(KEEPER_PK, provider);
+      const dbal = await provider.getBalance(deployer.address);
+      if (dbal < GAS_TOPUP_AMOUNT + GAS_RESERVE) {
+        console.error(`[Gas] deployer too low (${ethers.formatEther(dbal)} ETH) to sponsor ${eoaAddress}`);
+        return;
+      }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const tx = await deployer.sendTransaction({ to: eoaAddress, value: GAS_TOPUP_AMOUNT });
+          await waitTx(tx);
+          console.log(`[Gas] topped up ${eoaAddress} +${ethers.formatEther(GAS_TOPUP_AMOUNT)} ETH`);
+          break;
+        } catch (e) {
+          if (!/nonce|replacement|already known/i.test(e.message) || attempt === 2) throw e;
+          await new Promise(r => setTimeout(r, 1500)); // nonce race with keeper — retry
+        }
+      }
+    } finally {
+      gasSponsoring.delete(eoaAddress);
+    }
+  } catch (e) {
+    console.error('[Gas] sponsor failed:', e.message);
   }
 }
 
@@ -314,6 +358,7 @@ async function getPortfolio(address) {
 
 async function sendEth(jid, toAddress, amount) {
   const signer = await getSignerForJid(jid);
+  await sponsorGas(signer.address);
   const value  = ethers.parseEther(String(amount));
   const tx = await signer.sendTransaction({ to: toAddress, value });
   await waitTx(tx);
@@ -326,6 +371,7 @@ async function sendToken(jid, symbol, toAddress, amount) {
   if (tokenInfo.address === 'native') return sendEth(jid, toAddress, amount);
 
   const signer = await getSignerForJid(jid);
+  await sponsorGas(signer.address);
   const units  = ethers.parseUnits(String(amount), tokenInfo.decimals);
 
   // If the smart account holds the tokens, withdraw via the account (owner=EOA
@@ -384,6 +430,7 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
   if (!toToken   || toToken.address === 'native')   throw new Error(`Unsupported output token: ${toSymbol}`);
 
   const signer  = await getSignerForJid(jid);
+  await sponsorGas(signer.address); // SAGE covers gas — keep the EOA funded
 
   const amtIn     = ethers.parseUnits(String(amountIn), fromToken.decimals);
   const amtOutMin = ethers.parseUnits(String(minAmountOut), toToken.decimals);
@@ -774,10 +821,10 @@ async function executeTool(name, input, jid) {
       if (!accountAddr) accountAddr = await ensureAccount(jid, row.address); // provision on demand
       if (accountAddr) {
         return {
-          smartAccount: accountAddr,   // deposit USDG/stocks here; on-chain Risk Guard
-          gasAddress:   row.address,   // fund this with testnet ETH for gas
+          address: accountAddr,        // the user's single wallet address
+          smartAccount: accountAddr,   // on-chain Risk Guard; SAGE covers gas
           chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID,
-          note: 'Deposit USDG and stocks to smartAccount. Fund gasAddress with testnet ETH for gas.',
+          note: 'This is the user\'s wallet — deposit USDG and stocks here. SAGE covers all gas automatically; the user never needs ETH.',
         };
       }
       return { address: row.address, chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID };
@@ -1091,10 +1138,17 @@ async function executeTool(name, input, jid) {
 
     if (name === 'get_faucet') {
       const row = await getOrCreateWallet(jid);
+      const accountAddr = await getAccountAddress(jid);
+      if (accountAddr) {
+        return {
+          address: accountAddr,
+          message: `Good news — SAGE covers all gas fees, so you don't need any testnet ETH. To trade, just deposit USDG to your wallet: ${accountAddr}`,
+        };
+      }
       return {
         faucetUrl: 'https://faucet.testnet.chain.robinhood.com/',
-        address: row.address, // gas EOA — testnet ETH for gas goes here
-        message: `Paste this gas address at the faucet to get testnet ETH for transaction fees.`,
+        address: row.address,
+        message: `Paste this address at the faucet to get testnet ETH for transaction fees.`,
       };
     }
 
@@ -1147,9 +1201,9 @@ NEVER GO SILENT:
 
 SMART ACCOUNT (important):
 - Every user has an on-chain smart account that holds their USDG and stocks and enforces SAGE's Risk Guard on-chain — even SAGE cannot withdraw their funds out, only the user's key can.
-- Each user has TWO addresses: the smartAccount (where they DEPOSIT USDG and stocks) and the gasAddress (which needs testnet ETH to pay transaction fees).
-- When showing get_wallet results: tell them to deposit USDG/stocks to the *smartAccount*, and fund the *gasAddress* with testnet ETH from the faucet.
-- If asked "why two addresses": the smart account protects funds on-chain; the gas address just pays network fees. Keep it to one line.
+- Users have ONE wallet address (the smart account). get_wallet returns it as 'address'. Tell them to deposit USDG and stocks there.
+- SAGE covers ALL gas fees automatically — users never need testnet ETH. If a user asks about gas or faucet, tell them SAGE handles gas and they just need USDG to trade.
+- If asked "is it safe": funds live in their on-chain account; even SAGE can't move them out — only their key can. Keep it to one line.
 
 BALANCE / PORTFOLIO:
 - ALWAYS call get_portfolio when the user asks about their balance, holdings, or portfolio — no exceptions
@@ -1272,7 +1326,7 @@ async function handleMessage(jid, text) {
     const account = eoa ? await ensureAccount(jid, eoa) : null;
 
     if (account) {
-      return `🔒 *Password set!*\n\nYou've got a *smart account* — an on-chain wallet where even SAGE can't move your funds out without your key.\n\n📥 *Deposit USDG & stocks here:*\n\`${account}\`\n\n⛽ *Fund gas here* (testnet ETH):\n\`${eoa}\`\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to start 🚀`;
+      return `🔒 *Password set!*\n\nYou've got a *smart account* — an on-chain wallet where even SAGE can't move your funds out without your key. And SAGE covers all gas fees, so you never need ETH. ⚡\n\n📥 *Your wallet — deposit USDG & stocks here:*\n\`${account}\`\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to start 🚀`;
     }
     return `🔒 *Password set!*\n\nYour wallet is ready. Fund it with testnet ETH:\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to get started 🚀`;
   }
