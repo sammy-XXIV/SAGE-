@@ -1,28 +1,54 @@
 # SAGE-RH
 
-WhatsApp DeFi agent + DEX for tokenized stocks on Robinhood Chain (Arbitrum Orbit L2).
+**Trade tokenized stocks from WhatsApp — with on-chain self-custody, zero gas, and no app.**
+
+SAGE is a Claude-powered AI agent you talk to over WhatsApp. It gives every user an on-chain smart-account wallet and lets them trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) against USDG on a custom AMM deployed on Robinhood Chain (Arbitrum Orbit L2) — no browser, no seed phrase, no gas, just chat.
 
 Built for the **Arbitrum Open House London** hackathon.
 
 ---
 
-## What it is
+## Why it's different
 
-SAGE is a Claude-powered AI agent you talk to over WhatsApp. It manages a non-custodial wallet for each user and lets them trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) against USDG on a Uniswap V2-style AMM deployed on Robinhood Chain Testnet — no app, no browser, just chat.
+Most "DeFi on chat" demos are thin wrappers over a custodial hot wallet — one server breach drains everyone. SAGE pushes the trust on-chain:
+
+- 🛡️ **On-chain Risk Guard** — each user's funds live in a `SageAccount` smart contract. SAGE's server key can only *trade* (swap on the SAGE DEX, capped per 24h) — it has no code path to move funds out. A fully compromised server can't drain a single wallet.
+- 🔑 **Real self-custody, opt-in** — a user can claim on-chain ownership of their account to their own key at any time. After that SAGE keeps trading for them but can never withdraw — only they can.
+- ⚡ **Gasless** — SAGE sponsors every transaction. Users never touch a faucet or hold ETH; they deal with a single wallet address.
+- 📈 **Original on-chain price oracle** — `SageOracle` publishes spot + TWAP prices for every pair, kept fresh by an in-process keeper.
+- 💬 **WhatsApp-native** — no app to install. Onboard, fund, trade, set limit orders, and go self-custodial entirely in chat.
 
 ---
 
 ## Architecture
 
 ```
-WhatsApp (Baileys) ──► server.js ──► Claude (tool use) ──► on-chain tx
-                           │
-                           ├── SageAMM (SageFactory + SagePair + SageRouter)
-                           ├── Supabase (wallets, sessions, history, trades, alerts)
-                           └── Price keeper (Finnhub → DEX rebalance every 60s)
+WhatsApp (Baileys)
+      │
+      ▼
+  server.js ───► Claude (haiku-4-5, tool use) ───► on-chain tx
+      │
+      ├── SageAccount / SageAccountFactory  (per-user smart wallets + on-chain Risk Guard)
+      ├── SageDEX  (SageFactory + SagePair + SageRouter — Uniswap V2-style AMM)
+      ├── SageOracle  (on-chain spot + TWAP prices)
+      ├── Gas sponsor  (deployer wallet tops up each user's session key)
+      ├── Price keeper  (Finnhub → DEX rebalance every 60s, pushes TWAP to oracle)
+      └── Supabase  (wallets, sessions, history, trades, alerts)
 ```
 
-### Chain
+### Custody model
+
+| Role | Who holds it | Can do | Cannot do |
+|---|---|---|---|
+| `sessionKey` | SAGE server (per-user EOA) | Swap on the DEX, capped per 24h | Withdraw funds out |
+| `owner` (pre-claim) | SAGE server (same EOA) | Withdraw on user's behalf, set limits | — |
+| `owner` (post-claim) | **The user's own key** | Withdraw, rotate keys, change caps | — |
+
+Funds (USDG + stocks) live in the `SageAccount`. The session key signs trades and SAGE pays the gas. Once a user claims ownership, the withdrawal path requires *their* key — not even SAGE can move funds out.
+
+---
+
+## Chain
 
 | Property | Value |
 |---|---|
@@ -30,12 +56,13 @@ WhatsApp (Baileys) ──► server.js ──► Claude (tool use) ──► on-
 | Chain ID | 46630 |
 | RPC | `https://rpc.testnet.chain.robinhood.com` |
 | Explorer | `https://explorer.testnet.chain.robinhood.com` |
-| Faucet | `https://faucet.testnet.chain.robinhood.com` |
 
 ### Deployed contracts
 
 | Contract | Address |
 |---|---|
+| SageAccountFactory | `0xcBe2F33bBB9824f29d253C14a812Ac4B6faE86a5` |
+| SageOracle | `0x47543D0d0eE57F08f5FBe213795d4078b4900C7D` |
 | SageFactory | `0x681c44F678b10bE02f5c8a14B22D1B672E967aaD` |
 | SageRouter | `0x275D5A1f0c5036B048Fa9BbB46373c885a4EF0A8` |
 | USDG | `0x7E955252E15c84f5768B83c41a71F9eba181802F` |
@@ -49,56 +76,95 @@ WhatsApp (Baileys) ──► server.js ──► Claude (tool use) ──► on-
 
 ## Features
 
-| Feature | How to use |
+| Feature | Say to SAGE |
 |---|---|
-| Wallet | "what's my wallet?" |
-| Portfolio | "show my portfolio" |
+| Wallet address | "what's my wallet?" |
+| Portfolio + PNL | "show my portfolio" |
 | Live prices | "TSLA price" |
 | Buy stock | "buy $50 of TSLA" |
 | Sell stock | "sell 0.1 TSLA" |
-| Send tokens | "send 10 USDG to 0x..." |
+| Send to any address | "send 10 USDG to 0x…" |
 | Price alert | "alert me when TSLA hits $450" |
-| Limit order | "buy $100 USDG of AMZN if it drops to $200" |
+| Limit order | "buy $100 of AMZN if it drops below $200" |
+| List / cancel orders | "show my orders" / "cancel order 3" |
+| Spending limit | "limit my trades to $100" |
 | Trade history | "show my trades" |
-| Faucet | "I need gas" |
+| **Claim self-custody** | "claim my wallet" (+ your own address) |
+| **Export private key** | "export my key" (password-gated) |
 
----
+### SAGE Risk Guard
 
-## Stack
+Before any swap, SAGE checks (and blocks unless the user overrides):
 
-- **WhatsApp**: [@whiskeysockets/baileys](https://github.com/WhiskeySockets/Baileys) — linked device protocol, auth persisted in Supabase
-- **AI**: Claude claude-sonnet-4-6 with tool use (get_portfolio, execute_swap, set_price_alert, etc.)
-- **Chain**: ethers.js v6 — wallet per user, private keys encrypted in Supabase
-- **DEX**: SageAMM — custom Uniswap V2 fork (SageFactory, SagePair with TWAP, SageRouter)
-- **Prices**: on-chain reserves (`rUSDG / rSTOCK`) for display; Finnhub for price keeper reference
-- **Backend**: Express on Railway
-- **Frontend**: Static HTML/JS DEX UI on GitHub Pages
-- **DB**: Supabase (PostgreSQL) — `rh_wallets`, `wa_sessions`, `rh_conversation_history`, `rh_trades`, `rh_alerts`
+- **Price impact** > 8% — pool too thin for the trade size
+- **Concentration** > 25% of portfolio in one trade
+- **Spending limit** — optional per-user max USDG per trade
+
+The 24h trading cap is additionally enforced **on-chain** by the `SageAccount` contract, independent of the server.
 
 ---
 
 ## Price architecture
 
-Display price is read directly from DEX pair reserves — no external API needed:
+Display price is read directly from DEX pair reserves — no external API in the hot path:
 
 ```
 price = rUSDG / rSTOCK   (from SagePair.getReserves())
 ```
 
-A background price keeper runs every 60s, fetches Finnhub market prices, and swaps via the DEX to rebalance any pool that drifts >1.5% from the real price.
+A background **price keeper** runs every 60s, fetches Finnhub market prices, and swaps through the DEX to rebalance any pool that drifts more than **0.1%** from the real price (tight enough for limit-order triggers). After each run it calls `SageOracle.updateAll()` to refresh on-chain TWAP snapshots.
+
+---
+
+## Security
+
+Hardened across two audits (see commit history):
+
+- Wallet private keys encrypted with **AES-256-GCM**, random per-secret scrypt salt
+- Passwords hashed with **scrypt + salt** (not raw SHA-256)
+- WhatsApp session keys encrypted at rest with a boot-derived key (fast path)
+- **Rate limiting** (per-IP behind Railway's proxy), timing-safe admin auth, separate `ADMIN_KEY`
+- Risk-guard `force` override can't be self-granted by the model (server-side gating)
+- Server-side **slippage floor** on every swap; transaction timeouts; generic error responses
+- Private-key export is intent-gated server-side and password-protected
+
+---
+
+## Stack
+
+- **WhatsApp**: [@whiskeysockets/baileys](https://github.com/WhiskeySockets/Baileys) — linked-device protocol, auth persisted (encrypted) in Supabase
+- **AI**: Claude `claude-haiku-4-5` with tool use (`get_portfolio`, `execute_swap`, `claim_ownership`, `set_limit_order`, …)
+- **Chain**: ethers.js v6
+- **Smart accounts**: `SageAccount` + `SageAccountFactory` — per-user on-chain wallets with the Risk Guard enforced in Solidity
+- **DEX**: SageDEX — custom Uniswap V2 fork (`SageFactory`, `SagePair` with TWAP, `SageRouter`)
+- **Oracle**: `SageOracle` — on-chain spot + TWAP price feed
+- **Backend**: Express on Railway
+- **Frontend**: static DEX UI on GitHub Pages
+- **DB**: Supabase (PostgreSQL)
 
 ---
 
 ## Running locally
 
-1. Add env vars to a `.env` file
+1. Add env vars to `.env` (see below)
 2. `npm install`
-3. `npm start` — starts the WhatsApp bot + Express API
-4. Scan the QR code with WhatsApp linked devices
+3. `npm start` — starts the WhatsApp bot + Express API + in-process price keeper
+4. Open `/qr?key=<ADMIN_KEY>` and scan with WhatsApp linked devices
 
-```bash
-# Separate terminal — local price keeper (optional, Railway runs it in-process)
-npm run price-keeper
+### Required env vars
+
+```
+ANTHROPIC_API_KEY=
+SUPABASE_URL=
+SUPABASE_KEY=
+ENCRYPTION_KEY=          # wallet encryption — required, no fallback
+ADMIN_KEY=               # admin endpoint auth (separate from ENCRYPTION_KEY)
+RPC_URL=
+DEPLOYER_PRIVATE_KEY=    # gas sponsor + price keeper
+FINNHUB_API_KEY=
+SAGE_ACCOUNT_FACTORY=    # defaults to the deployed factory
+SAGE_ORACLE=             # defaults to the deployed oracle
+PORT=
 ```
 
 ---
@@ -107,13 +173,13 @@ npm run price-keeper
 
 | Table | Purpose |
 |---|---|
-| `rh_wallets` | User wallet address + encrypted private key |
-| `wa_sessions` | Baileys auth state (persists WhatsApp session across deploys) |
+| `rh_wallets` | User EOA + encrypted key + `account_address` (smart account) |
+| `wa_sessions` | Baileys auth state (encrypted, survives deploys) |
 | `rh_conversation_history` | Per-user Claude message history |
-| `rh_trades` | Every swap logged for PNL tracking |
-| `rh_alerts` | Price alerts and limit orders |
+| `rh_trades` | Every swap logged for PNL |
+| `rh_alerts` | Price alerts, limit orders, and per-user config |
 
-Migrations are in `supabase/migrations/`.
+Migrations in `supabase/migrations/`.
 
 ---
 
@@ -121,6 +187,11 @@ Migrations are in `supabase/migrations/`.
 
 Compiled with Hardhat. Source in `contracts/`:
 
+- `SageAccount.sol` — per-user smart wallet; session key trades (capped on-chain), owner withdraws
+- `SageAccountFactory.sol` — deploys + indexes accounts, keyed by `keccak256(jid)` (no phone numbers on-chain)
 - `SageFactory.sol` — CREATE2 pair deployment
-- `SagePair.sol` — x\*y=k AMM + TWAP oracle
+- `SagePair.sol` — x·y=k AMM + TWAP oracle
 - `SageRouter.sol` — swap + liquidity routing
+- `SageOracle.sol` — on-chain spot + TWAP price aggregation
+
+On-chain proofs of the custody model are in `scripts/` (`deploy-account`, `test-account-integration`, `test-gas-sponsor`, `test-claim-flow`).
