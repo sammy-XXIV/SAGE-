@@ -663,12 +663,26 @@ async function executeTool(name, input, jid) {
     }
 
     if (name === 'set_limit_order') {
-      const { symbol, action, condition, target_price, amount } = input;
+      const { symbol, action, target_price, amount } = input;
+      const sym = symbol.toUpperCase();
+
+      // Auto-detect condition from current price vs target — don't trust AI's condition field
+      const priceData = await getStockPrice(sym);
+      const currentPrice = priceData ? priceData.price : null;
+      let condition;
+      if (currentPrice !== null) {
+        condition = target_price > currentPrice ? 'above' : 'below';
+      } else {
+        // fallback to AI-provided condition if price fetch fails
+        condition = input.condition;
+      }
+
       const { error } = await supabase.from('rh_alerts').insert({
-        jid, type: 'limit', symbol: symbol.toUpperCase(), condition, target_price, action, amount,
+        jid, type: 'limit', symbol: sym, condition, target_price, action, amount,
       });
       if (error) return { error: error.message };
-      return { success: true, message: `Limit order set: ${action} ${amount} ${action === 'buy' ? 'USDG of' : ''} ${symbol.toUpperCase()} when price goes ${condition} $${target_price}` };
+      const dir = condition === 'above' ? 'rises to' : 'drops to';
+      return { success: true, message: `Limit order set: ${action} ${amount} ${action === 'buy' ? 'USDG of' : ''} ${sym} when price ${dir} $${target_price}${currentPrice ? ` (currently $${currentPrice.toFixed(2)})` : ''}` };
     }
 
     if (name === 'get_trade_history') {
