@@ -103,6 +103,7 @@ const ACCOUNT_FACTORY_ABI = [
 const SAGE_ACCOUNT_ABI = [
   'function swap(uint256 amountIn, uint256 amountOutMin, address[] path, uint256 deadline) external returns (uint256)',
   'function withdraw(address token, address to, uint256 amount) external',
+  'function transferOwnership(address newOwner) external',
   'function owner() view returns (address)',
   'function sessionKey() view returns (address)',
   'function remainingToday() view returns (uint256)',
@@ -381,11 +382,19 @@ async function sendToken(jid, symbol, toAddress, amount) {
     try {
       if ((await tokenBalanceOf(tokenInfo.address, accountAddr)) >= units) {
         const account = new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, signer);
+        // If self-custodied, SAGE is no longer owner and can't withdraw — say so clearly.
+        const owner = await account.owner();
+        if (owner.toLowerCase() !== signer.address.toLowerCase()) {
+          throw new Error(`SELF_CUSTODIED: Your wallet is self-custodied — SAGE can no longer move your funds out. Withdraw ${symbol} yourself using your own wallet (e.g. MetaMask) that owns the account.`);
+        }
         const tx = await account.withdraw(tokenInfo.address, toAddress, units);
         await waitTx(tx);
         return tx.hash;
       }
-    } catch (e) { console.error('[Send] account withdraw failed, trying EOA:', e.message); }
+    } catch (e) {
+      if (/^SELF_CUSTODIED:/.test(e.message)) throw new Error(e.message.replace('SELF_CUSTODIED: ', ''));
+      console.error('[Send] account withdraw failed, trying EOA:', e.message);
+    }
   }
 
   const contract = new ethers.Contract(tokenInfo.address, ERC20_ABI, signer);
@@ -810,6 +819,17 @@ const sageTools = [
       required: ['limit_usdg'],
     },
   },
+  {
+    name: 'claim_ownership',
+    description: 'Transfer on-chain ownership of the user\'s smart account to their OWN wallet address (e.g. their MetaMask), making it fully self-custodial. After this, SAGE can still trade on their behalf but can NEVER withdraw their funds — only the new owner can. This is IRREVERSIBLE by SAGE: once transferred, SAGE cannot reclaim ownership. ONLY call this after the user has provided their own external wallet address AND explicitly confirmed they understand SAGE will no longer be able to move funds out.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        new_owner: { type: 'string', description: 'The user\'s own external wallet address (e.g. MetaMask) to become the account owner.' },
+      },
+      required: ['new_owner'],
+    },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────
@@ -820,11 +840,21 @@ async function executeTool(name, input, jid) {
       let accountAddr = await getAccountAddress(jid);
       if (!accountAddr) accountAddr = await ensureAccount(jid, row.address); // provision on demand
       if (accountAddr) {
+        // Self-custodied = owner is no longer the SAGE-held EOA
+        let selfCustodied = false, owner = null;
+        try {
+          owner = await new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, provider).owner();
+          selfCustodied = owner.toLowerCase() !== row.address.toLowerCase();
+        } catch {}
         return {
           address: accountAddr,        // the user's single wallet address
           smartAccount: accountAddr,   // on-chain Risk Guard; SAGE covers gas
+          selfCustodied,               // true once the user has claimed ownership
+          owner,
           chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID,
-          note: 'This is the user\'s wallet — deposit USDG and stocks here. SAGE covers all gas automatically; the user never needs ETH.',
+          note: selfCustodied
+            ? 'This wallet is self-custodied — only the user\'s own key can withdraw. SAGE can still trade for them.'
+            : 'This is the user\'s wallet — deposit USDG and stocks here. SAGE covers all gas automatically. The user can say "claim my wallet" to make it fully self-custodial.',
         };
       }
       return { address: row.address, chain: 'Robinhood Chain Testnet', chainId: CHAIN_ID };
@@ -1152,6 +1182,39 @@ async function executeTool(name, input, jid) {
       };
     }
 
+    if (name === 'claim_ownership') {
+      const newOwner = input.new_owner;
+      if (!ethers.isAddress(newOwner)) return { error: 'That doesn\'t look like a valid wallet address. Send your own wallet address (starts with 0x).' };
+
+      const row = await getOrCreateWallet(jid);
+      const accountAddr = await getAccountAddress(jid);
+      if (!accountAddr) return { error: 'You don\'t have a smart account yet — say "what\'s my wallet" to set one up first.' };
+
+      const signer  = await getSignerForJid(jid);
+      await sponsorGas(signer.address);
+      const account = new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, signer);
+
+      // Must currently be SAGE-owned to transfer
+      const currentOwner = await account.owner();
+      if (currentOwner.toLowerCase() !== signer.address.toLowerCase()) {
+        return { error: 'already_claimed', message: `This wallet is already self-custodied (owner: ${currentOwner}). SAGE cannot change its ownership.` };
+      }
+      if (newOwner.toLowerCase() === signer.address.toLowerCase()) {
+        return { error: 'That\'s SAGE\'s own key — send YOUR wallet address so you get full control.' };
+      }
+
+      const tx = await account.transferOwnership(newOwner);
+      await waitTx(tx);
+      return {
+        success: true,
+        account: accountAddr,
+        new_owner: newOwner,
+        hash: tx.hash,
+        explorer: `https://explorer.testnet.chain.robinhood.com/tx/${tx.hash}`,
+        message: `✅ Done. Your wallet is now self-custodied. SAGE can still trade for you, but only ${newOwner.slice(0,6)}…${newOwner.slice(-4)} can withdraw your funds — not even SAGE can. To withdraw, use your own wallet (e.g. MetaMask) on Robinhood Chain.`,
+      };
+    }
+
     return { error: 'Unknown tool' };
   } catch (e) {
     console.error(`Tool error [${name}]:`, e.message);
@@ -1200,10 +1263,18 @@ NEVER GO SILENT:
 - If the user says something you don't understand, ask them to clarify — never ignore the message
 
 SMART ACCOUNT (important):
-- Every user has an on-chain smart account that holds their USDG and stocks and enforces SAGE's Risk Guard on-chain — even SAGE cannot withdraw their funds out, only the user's key can.
+- Every user has an on-chain smart account that holds their USDG and stocks and enforces SAGE's Risk Guard on-chain.
 - Users have ONE wallet address (the smart account). get_wallet returns it as 'address'. Tell them to deposit USDG and stocks there.
 - SAGE covers ALL gas fees automatically — users never need testnet ETH. If a user asks about gas or faucet, tell them SAGE handles gas and they just need USDG to trade.
-- If asked "is it safe": funds live in their on-chain account; even SAGE can't move them out — only their key can. Keep it to one line.
+- Custody: by default SAGE holds the account's owner key (so it can help them fully), but trading is capped on-chain. A user can become FULLY self-custodial by claiming ownership (see below). Be accurate: pre-claim, SAGE can move funds; post-claim, only the user can. Don't overstate safety.
+
+SELF-CUSTODY / CLAIM OWNERSHIP:
+- If the user says "claim my wallet", "make it self-custodial", "I want full control", "transfer ownership to me", "secure my wallet to my own key", or similar: use claim_ownership.
+- First ask for THEIR OWN external wallet address (e.g. their MetaMask address on Robinhood Chain).
+- Then clearly explain, and get explicit confirmation: "After this, you'll have full control — SAGE can still trade for you, but only YOU can withdraw. This can't be undone by SAGE. Send your wallet address and confirm."
+- Only call claim_ownership after they provide their address AND confirm.
+- After claiming: if they ask SAGE to send/withdraw their funds out, explain they must do it themselves with their own wallet now — SAGE can no longer move funds out (this is the whole point of claiming).
+- Never invent an address — the user must provide their own.
 
 BALANCE / PORTFOLIO:
 - ALWAYS call get_portfolio when the user asks about their balance, holdings, or portfolio — no exceptions
