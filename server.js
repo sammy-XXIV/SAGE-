@@ -447,7 +447,7 @@ const sageTools = [
       type: 'object',
       properties: {
         symbol:       { type: 'string', description: 'Stock symbol: TSLA, AMZN, PLTR, NFLX, AMD' },
-        condition:    { type: 'string', enum: ['above', 'below'], description: 'Trigger when price goes above or below target' },
+        condition:    { type: 'string', enum: ['above', 'below', 'at'], description: 'Trigger when price goes above, below, or reaches (at) target' },
         target_price: { type: 'number', description: 'Price threshold in USDG' },
       },
       required: ['symbol', 'condition', 'target_price'],
@@ -461,7 +461,7 @@ const sageTools = [
       properties: {
         symbol:       { type: 'string', description: 'Stock symbol: TSLA, AMZN, PLTR, NFLX, AMD' },
         action:       { type: 'string', enum: ['buy', 'sell'], description: 'Buy or sell' },
-        condition:    { type: 'string', enum: ['above', 'below'], description: 'Execute when price goes above or below target' },
+        condition:    { type: 'string', enum: ['above', 'below', 'at'], description: 'Execute when price rises above, drops below, or reaches (at) target' },
         target_price: { type: 'number', description: 'Trigger price in USDG' },
         amount:       { type: 'number', description: 'Amount of USDG to spend (buy) or stock amount to sell' },
       },
@@ -685,10 +685,14 @@ async function executeTool(name, input, jid) {
       const { symbol, action, target_price, amount } = input;
       const sym = symbol.toUpperCase();
 
-      // Trust the AI's condition (parsed from user's words — "below", "above", "drops to", "rises to")
-      const condition = input.condition;
       const priceData = await getStockPrice(sym);
       const currentPrice = priceData ? priceData.price : null;
+
+      // Resolve 'at' into above/below based on current price
+      let condition = input.condition;
+      if (condition === 'at') {
+        condition = currentPrice !== null && currentPrice < target_price ? 'above' : 'below';
+      }
 
       // Warn if condition already satisfied — would fire immediately
       if (currentPrice !== null) {
@@ -864,8 +868,10 @@ PRICE ALERTS:
 - Alerts trigger automatically in the background
 
 LIMIT ORDERS:
-- When user says "buy $X USDG of TSLA if it drops to $Y": call set_limit_order with action=buy, condition=below
-- When user says "sell N TSLA if it hits $Y": call set_limit_order with action=sell, condition=above
+- When user says "buy X if it drops below $Y": condition=below
+- When user says "buy X if it rises above $Y": condition=above
+- When user says "buy X when it gets to $Y" or "when the price is at $Y" or "when it reaches $Y": condition=at (system auto-detects direction)
+- Same logic applies to sell orders
 - Confirm the order details and note it will auto-execute
 
 ORDERS & ALERTS:
@@ -1432,7 +1438,8 @@ async function runAlertMonitor() {
       for (const alert of rows) {
         const triggered =
           (alert.condition === 'above' && price >= alert.target_price) ||
-          (alert.condition === 'below' && price <= alert.target_price);
+          (alert.condition === 'below' && price <= alert.target_price) ||
+          (alert.condition === 'at' && Math.abs(price - alert.target_price) / alert.target_price <= 0.01);
         if (!triggered) continue;
 
         if (alert.type === 'alert') {
