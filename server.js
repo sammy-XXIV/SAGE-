@@ -1246,6 +1246,29 @@ app.get('/price/:symbol', async (req, res) => {
   }
 });
 
+app.get('/admin/status', async (req, res) => {
+  if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const keeper = new ethers.Wallet(KEEPER_PK, provider);
+    const usdgContract = new ethers.Contract(TOKENS.USDG.address, ['function balanceOf(address) view returns (uint256)'], provider);
+    const ethBal  = await provider.getBalance(keeper.address);
+    const usdgBal = await usdgContract.balanceOf(keeper.address);
+    const prices  = {};
+    for (const sym of ['TSLA','AMZN','NFLX','AMD','PLTR']) {
+      const d = await getStockPrice(sym);
+      prices[sym] = d ? `$${d.price.toFixed(2)}` : 'error';
+    }
+    res.json({
+      keeper: keeper.address,
+      eth: ethers.formatEther(ethBal),
+      usdg: ethers.formatUnits(usdgBal, 6),
+      dex_prices: prices,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/admin/keeper', async (req, res) => {
   if (req.query.key !== ENCRYPTION_KEY) return res.status(401).json({ error: 'unauthorized' });
   try {
