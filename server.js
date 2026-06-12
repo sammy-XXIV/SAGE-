@@ -1308,7 +1308,7 @@ app.get('/prices', async (req, res) => {
 });
 
 // ── Price keeper (runs in-process every 60s) ──────────────────
-const KEEPER_THRESHOLD = 0.015;
+const KEEPER_THRESHOLD = 0.001; // 0.1% — keep DEX tight enough for limit order triggers
 const KEEPER_PK = process.env.DEPLOYER_PRIVATE_KEY;
 
 const KEEPER_ROUTER_ABI = [
@@ -1431,21 +1431,9 @@ async function runAlertMonitor() {
     }
 
     for (const [sym, rows] of Object.entries(bySymbol)) {
-      // Use real market price from Finnhub for alerts — DEX price lags by up to 1.5%
-      let price = null;
-      if (FINNHUB_KEY) {
-        try {
-          const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
-          const q = await r.json();
-          if (q?.c && q.c > 0) price = q.c;
-        } catch {}
-      }
-      if (!price) {
-        // fallback to DEX price if Finnhub fails
-        const priceData = await getStockPrice(sym);
-        if (!priceData) continue;
-        price = priceData.price;
-      }
+      const priceData = await getStockPrice(sym);
+      if (!priceData) continue;
+      const { price } = priceData;
 
       for (const alert of rows) {
         const triggered =
