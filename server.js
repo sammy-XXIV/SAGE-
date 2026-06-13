@@ -1335,49 +1335,19 @@ UNSUPPORTED REQUESTS:
 async function handleMessage(jid, text) {
   const state = onboardingState.get(jid);
 
-  // ── Onboarding: first ever message ───────────────────────────
+  // ── Onboarding: first ever message — auto-create wallet, single path ──
   if (!state) {
-    // Check if wallet already exists in DB
     const { data } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
     if (data) {
-      // Returning user — skip onboarding
-      onboardingState.set(jid, 'done');
+      onboardingState.set(jid, 'done'); // returning user — skip onboarding
     } else {
-      onboardingState.set(jid, 'awaiting_choice');
-      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed — I'll set you up with a secure on-chain smart wallet.\n\nTo begin:\n*1️⃣ Create a new wallet* (recommended)\n*2️⃣ Import an existing wallet*\n\nReply *1* or *2*`;
-    }
-  }
-
-  // ── Onboarding: waiting for 1 or 2 ───────────────────────────
-  if (state === 'awaiting_choice') {
-    const choice = text.trim();
-    if (choice === '1') {
+      // One path, zero decisions: silently create the wallet, then ask for a password.
       const wallet = ethers.Wallet.createRandom();
       const encrypted_pk = encrypt(wallet.privateKey);
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
       onboardingState.set(jid, 'awaiting_password_set');
-      return `✅ *Wallet created and encrypted.*\n\nNow set a *password* to protect it — you'll need it to export your key later.\n\nReply with your chosen password:`;
-    } else if (choice === '2') {
-      onboardingState.set(jid, 'awaiting_pk');
-      return `🔑 Send your *private key* and I'll import your wallet.\n\n⚠️ It will be encrypted and stored securely. This message will be deleted immediately.`;
-    } else {
-      return `Please reply *1* to generate a new wallet or *2* to import an existing one.`;
-    }
-  }
-
-  // ── Onboarding: waiting for private key ──────────────────────
-  if (state === 'awaiting_pk') {
-    try {
-      const pk = text.trim().startsWith('0x') ? text.trim() : `0x${text.trim()}`;
-      const wallet = new ethers.Wallet(pk);
-      const encrypted_pk = encrypt(wallet.privateKey);
-      await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
-      activeWalletRegistry.set(jid, wallet.address);
-      onboardingState.set(jid, 'awaiting_password_set');
-      return `✅ *Wallet imported and encrypted.*\n\nNow set a *password* to protect it — you'll need it to export your key later.\n\nReply with your chosen password:`;
-    } catch {
-      return `❌ Invalid private key. Please try again or reply *1* to generate a new wallet instead.`;
+      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed — I've just created a secure on-chain wallet for you. ⚡\n\nSet a *password* to protect it (you'll need it to export your key later).\n\nReply with your chosen password:`;
     }
   }
 
@@ -1399,7 +1369,7 @@ async function handleMessage(jid, text) {
     if (account) {
       return `🔒 *Password set!*\n\nYou've got a *smart account* — an on-chain wallet where even SAGE can't move your funds out without your key. And SAGE covers all gas fees, so you never need ETH. ⚡\n\n📥 *Your wallet — deposit USDG & stocks here:*\n\`${account}\`\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to start 🚀`;
     }
-    return `🔒 *Password set!*\n\nYour wallet is ready. Fund it with testnet ETH:\nhttps://faucet.testnet.chain.robinhood.com/\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to get started 🚀`;
+    return `🔒 *Password set!*\n\nYour wallet is ready. To trade, just deposit USDG — SAGE covers all gas.\n\nSay *"what's my wallet"* to get your address, or *"show my portfolio"* to start 🚀`;
   }
 
   // ── Export private key: waiting for password ──────────────────
