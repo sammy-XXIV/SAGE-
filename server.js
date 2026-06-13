@@ -1299,6 +1299,9 @@ Personality:
 - Give opinions when asked about stocks
 - Never make stuff up — if you don't know, say so
 
+LANGUAGE:
+- Always reply in the SAME language the user writes to you in (English, French, Yoruba, Spanish, Pidgin, Swahili, Arabic, etc.). If they switch languages, switch with them. Keep ticker symbols and addresses as-is.
+
 Formatting rules (WhatsApp):
 - Use *bold* only on the single most important value per message
 - No markdown headers (#, ##) — use plain text structure
@@ -1401,7 +1404,7 @@ async function handleMessage(jid, text) {
       const account = await ensureAccount(jid, wallet.address);
       const addr = account || wallet.address;
       const setupLink = `${FRONTEND_BASE}/secure.html?t=${makeSecureToken(jid)}`;
-      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed. I've set up your on-chain wallet and I cover all the gas. ⚡\n\n📥 *Your wallet — deposit USDG here to start:*\n\`${addr}\`\n\n🔐 *Secure it:* set a password to take full self-custody — do it now or anytime (you'll use this password later to export your key or withdraw):\n${setupLink}\n\nThen say *"buy $10 of TSLA"* or *"show my portfolio"* to begin 🚀`;
+      return `👋 Welcome to *SAGE* — your on-chain wallet is ready. No app, no gas, no crypto experience needed. ⚡\n\n🔐 *Secure it now — do this first.* Set your password so only YOU can ever withdraw. Takes 10 seconds:\n${setupLink}\n\n(Until you do, your funds are safe but SAGE holds the keys. Setting a password makes it truly yours.)\n\n📥 Then deposit USDG here to trade:\n\`${addr}\`\n\nor just say *"buy $10 of TSLA"* / *"show my portfolio"*.`;
     }
   }
 
