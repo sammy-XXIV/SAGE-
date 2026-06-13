@@ -129,6 +129,18 @@ function peekSecureToken(token) {
   return t;
 }
 
+// Password-encrypted owner keystore (ciphertext only — the password never reaches
+// the server). Stored in the now-unused password_hash column. The user sets it
+// once on the secure page; later they re-enter the password to decrypt locally.
+async function getKeystore(jid) {
+  const { data } = await supabase.from('rh_wallets').select('password_hash').eq('jid', jid).single();
+  const v = data?.password_hash;
+  return (v && v.trim().startsWith('{')) ? v : null; // keystore JSON only; ignore legacy hashes
+}
+async function setKeystore(jid, keystore) {
+  await supabase.from('rh_wallets').update({ password_hash: keystore }).eq('jid', jid);
+}
+
 // ── Encryption ─────────────────────────────────────────────────
 // v2 format:           v2:salt:iv:tag:ct   — AES-256-GCM, random per-secret salt (authenticated)
 // legacy CBC random:   salt:iv:ct          (3 parts)
@@ -1362,7 +1374,7 @@ FAUCET:
 FULL CONTROL / PASSWORD / PRIVATE KEY / WITHDRAW TO SELF:
 - SAGE never handles passwords or private keys in chat — they'd sit in chat history.
 - Whenever the user wants to: set a password, secure their wallet, take full control/ownership, go self-custodial, export their key, or withdraw to their own control — call get_secure_link and send them the one-time link.
-- On that page they set a password and a key is generated in their own browser; SAGE never sees it. No MetaMask needed. Tell them: the link works once, expires in 1 hour, and forgetting the password means losing access (same as any self-custodial wallet).
+- The page auto-detects: first time it lets them SET a password (a key is generated in their browser, SAGE never sees it); after that it lets them ENTER that same password to export their key or withdraw. No MetaMask needed. Tell them: the link works once, expires in 1 hour, and the password can't be reset — forgetting it means losing access (same as any self-custodial wallet).
 - (Power users who already have a wallet can instead just provide their own address and you can use claim_ownership directly.)
 
 UNSUPPORTED REQUESTS:
@@ -1388,7 +1400,8 @@ async function handleMessage(jid, text) {
       onboardingState.set(jid, 'done');
       const account = await ensureAccount(jid, wallet.address);
       const addr = account || wallet.address;
-      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed. I've set up your on-chain wallet and I cover all the gas. ⚡\n\n📥 *Your wallet — deposit USDG here to start:*\n\`${addr}\`\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to begin 🚀\n\nWant full control of your funds anytime? Just say *"claim my wallet"*.`;
+      const setupLink = `${FRONTEND_BASE}/secure.html?t=${makeSecureToken(jid)}`;
+      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed. I've set up your on-chain wallet and I cover all the gas. ⚡\n\n📥 *Your wallet — deposit USDG here to start:*\n\`${addr}\`\n\n🔐 *Secure it:* set a password to take full self-custody — do it now or anytime (you'll use this password later to export your key or withdraw):\n${setupLink}\n\nThen say *"buy $10 of TSLA"* or *"show my portfolio"* to begin 🚀`;
     }
   }
 
@@ -1763,28 +1776,33 @@ function claimCors(res) {
 }
 app.options('/claim/info', (req, res) => { claimCors(res); res.status(204).end(); });
 app.options('/claim/complete', (req, res) => { claimCors(res); res.status(204).end(); });
+app.options('/vault/get', (req, res) => { claimCors(res); res.status(204).end(); });
 
-// Validate a token and return the account to be claimed (no jid exposed).
+// Validate a token; tell the page whether to SET a password (first time) or
+// UNLOCK with an existing one. No jid exposed.
 app.get('/claim/info', async (req, res) => {
   claimCors(res);
   const t = peekSecureToken(req.query.token);
   if (!t) return res.status(404).json({ ok: false, error: 'This link is invalid or has expired. Ask SAGE for a new one.' });
   try {
+    const row = await getOrCreateWallet(t.jid);
     const account = await getAccountAddress(t.jid);
     if (!account) return res.status(409).json({ ok: false, error: 'No smart account found.' });
     const owner = await new ethers.Contract(account, SAGE_ACCOUNT_ABI, provider).owner();
-    res.json({ ok: true, account, alreadyClaimed: owner.toLowerCase() !== activeWalletRegistry.get(t.jid)?.toLowerCase() });
+    const hasKeystore = !!(await getKeystore(t.jid));
+    res.json({ ok: true, account, hasKeystore, claimed: owner.toLowerCase() !== row.address.toLowerCase() });
   } catch (e) {
     console.error('[Claim] info error:', e.message);
     res.status(500).json({ ok: false, error: 'internal error' });
   }
 });
 
-// Complete the claim: page submits the browser-generated public address; the
-// server transfers ownership to it (signed by SAGE's session key, gas sponsored).
+// SETUP: page submits the browser-generated owner address + its password-encrypted
+// keystore. Server transfers ownership (session-key signed, gas sponsored) and
+// stores the keystore ciphertext (never the password).
 app.post('/claim/complete', async (req, res) => {
   claimCors(res);
-  const { token, owner } = req.body || {};
+  const { token, owner, keystore } = req.body || {};
   const t = peekSecureToken(token);
   if (!t) return res.status(404).json({ ok: false, error: 'Link invalid or expired.' });
   if (!ethers.isAddress(owner)) return res.status(400).json({ ok: false, error: 'Bad owner address.' });
@@ -1801,13 +1819,31 @@ app.post('/claim/complete', async (req, res) => {
     }
     const tx = await account.transferOwnership(owner);
     await waitTx(tx);
+    if (keystore && String(keystore).trim().startsWith('{')) await setKeystore(t.jid, keystore);
     secureTokens.delete(token); // one-time use
-    // Let the user know in WhatsApp too
-    sendWAMessage(t.jid, `✅ *Self-custody activated.*\nYour wallet is now owned by \`${owner}\`. I can still trade for you, but only your key can withdraw — not even SAGE. Keep your downloaded key file safe.`).catch(() => {});
+    sendWAMessage(t.jid, `✅ *Self-custody activated.*\nYour wallet is now yours — secured by your password. I can still trade for you, but only you can withdraw or export your key. Keep your password safe; it can't be reset.`).catch(() => {});
     res.json({ ok: true, account: accountAddr, owner, hash: tx.hash, explorer: `https://explorer.testnet.chain.robinhood.com/tx/${tx.hash}` });
   } catch (e) {
     console.error('[Claim] complete error:', e.message);
     res.status(500).json({ ok: false, error: 'Transfer failed — try the link again.' });
+  }
+});
+
+// UNLOCK: return the stored encrypted keystore so the page can decrypt it locally
+// with the user's password (to export the key or sign a withdrawal). Ciphertext
+// only — useless without the password. Token not consumed so password can be retried.
+app.post('/vault/get', async (req, res) => {
+  claimCors(res);
+  const t = peekSecureToken(req.body?.token);
+  if (!t) return res.status(404).json({ ok: false, error: 'Link invalid or expired.' });
+  try {
+    const keystore = await getKeystore(t.jid);
+    if (!keystore) return res.status(404).json({ ok: false, error: 'No saved key — set a password first.' });
+    const account = await getAccountAddress(t.jid);
+    res.json({ ok: true, keystore, account });
+  } catch (e) {
+    console.error('[Vault] get error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
   }
 });
 
