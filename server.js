@@ -1907,12 +1907,22 @@ app.get('/analytics/ai', async (req, res) => {
       const r = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 320,
-        system: 'You are SAGE, a sharp DeFi market analyst for a tokenized-stock DEX (TSLA, AMZN, NFLX, PLTR, AMD vs USDG) on Robinhood Chain. Given live pool data, write a concise market read of 3-5 short sentences: the biggest mover(s), overall liquidity/TVL health, anything that stands out, and ONE actionable insight for a trader. Direct and confident, no fluff, no disclaimers, no markdown headers.',
+        system: 'You are SAGE, a sharp DeFi market analyst for a tokenized-stock DEX (TSLA, AMZN, NFLX, PLTR, AMD vs USDG) on Robinhood Chain. Given live pool data, write a concise market read of 3-5 short sentences: the biggest mover(s), overall liquidity/TVL health, anything that stands out, and ONE actionable insight for a trader. Direct and confident, no fluff, no disclaimers. PLAIN TEXT ONLY — no markdown, no asterisks, no bold, no bullet points, no headers.',
         messages: [{ role: 'user', content: `Total TVL: $${Math.round(a.totalTvl)}. Pools: ${JSON.stringify(data)}` }],
       });
       analysis = r.content.find(b => b.type === 'text')?.text?.trim();
     } catch (e) {
       console.error('[AI Analytics] model error:', e.message);
+    }
+    // Strip markdown so it renders clean as plain text on the page
+    if (analysis) {
+      analysis = analysis
+        .replace(/\*\*(.+?)\*\*/g, '$1')   // bold
+        .replace(/\*(.+?)\*/g, '$1')       // italics
+        .replace(/`(.+?)`/g, '$1')         // code
+        .replace(/^#+\s*/gm, '')           // headers
+        .replace(/^\s*[-*]\s+/gm, '')      // bullet markers
+        .trim();
     }
     if (!analysis) {
       const top = [...data].sort((x, y) => parseFloat(y.change24h) - parseFloat(x.change24h))[0];
