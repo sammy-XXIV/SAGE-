@@ -1859,8 +1859,7 @@ app.get('/prices', async (req, res) => {
 });
 
 // ── DEX analytics (public, for the frontend analytics page) ───────────
-app.get('/analytics', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
+async function gatherAnalytics() {
   const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
   let totalTvl = 0;
   const pairs = [];
@@ -1874,8 +1873,8 @@ app.get('/analytics', async (req, res) => {
       const rUSDG  = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
       const rSTOCK = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
       const price  = rSTOCK > 0 ? rUSDG / rSTOCK : 0;
-      const pd     = await getStockPrice(sym); // for 24h change vs market
-      const poolTvl = rUSDG * 2; // USDG-denominated pool; TVL ≈ 2× USDG reserve
+      const pd     = await getStockPrice(sym);
+      const poolTvl = rUSDG * 2;
       totalTvl += poolTvl;
       pairs.push({ symbol: sym, price, change: pd?.change ?? '0.00', usdgReserve: rUSDG, stockReserve: rSTOCK, tvl: poolTvl, pair: pairAddr });
     } catch (e) {
@@ -1883,15 +1882,48 @@ app.get('/analytics', async (req, res) => {
     }
   }));
   pairs.sort((a, b) => syms.indexOf(a.symbol) - syms.indexOf(b.symbol));
-  res.json({
-    ok: true,
-    totalTvl,
-    pairCount: pairs.filter(p => !p.error).length,
-    router: DEX?.router || null,
-    oracle: SAGE_ORACLE_ADDRESS,
-    pairs,
-    updatedAt: new Date().toISOString(),
-  });
+  return { totalTvl, pairCount: pairs.filter(p => !p.error).length, pairs };
+}
+
+app.get('/analytics', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
+  const a = await gatherAnalytics();
+  res.json({ ok: true, ...a, router: DEX?.router || null, oracle: SAGE_ORACLE_ADDRESS, updatedAt: new Date().toISOString() });
+});
+
+// AI market read — SAGE analyzes the live pool data. Cached so page loads don't spam the model.
+let aiAnalysisCache = { text: null, at: 0 };
+const AI_ANALYSIS_TTL = 3 * 60_000;
+app.get('/analytics/ai', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
+  try {
+    if (aiAnalysisCache.text && Date.now() - aiAnalysisCache.at < AI_ANALYSIS_TTL) {
+      return res.json({ ok: true, analysis: aiAnalysisCache.text, generatedAt: new Date(aiAnalysisCache.at).toISOString(), cached: true });
+    }
+    const a = await gatherAnalytics();
+    const data = a.pairs.filter(p => !p.error).map(p => ({ sym: p.symbol, price: +p.price.toFixed(2), change24h: p.change + '%', usdgLiquidity: Math.round(p.usdgReserve), tvl: Math.round(p.tvl) }));
+    let analysis;
+    try {
+      const r = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 320,
+        system: 'You are SAGE, a sharp DeFi market analyst for a tokenized-stock DEX (TSLA, AMZN, NFLX, PLTR, AMD vs USDG) on Robinhood Chain. Given live pool data, write a concise market read of 3-5 short sentences: the biggest mover(s), overall liquidity/TVL health, anything that stands out, and ONE actionable insight for a trader. Direct and confident, no fluff, no disclaimers, no markdown headers.',
+        messages: [{ role: 'user', content: `Total TVL: $${Math.round(a.totalTvl)}. Pools: ${JSON.stringify(data)}` }],
+      });
+      analysis = r.content.find(b => b.type === 'text')?.text?.trim();
+    } catch (e) {
+      console.error('[AI Analytics] model error:', e.message);
+    }
+    if (!analysis) {
+      const top = [...data].sort((x, y) => parseFloat(y.change24h) - parseFloat(x.change24h))[0];
+      analysis = `Total value locked sits at $${Math.round(a.totalTvl)} across ${a.pairCount} pools. ${top?.sym || 'Markets'} leads at ${top?.change24h || '—'}. Liquidity is healthy and balanced across pairs.`;
+    }
+    aiAnalysisCache = { text: analysis, at: Date.now() };
+    res.json({ ok: true, analysis, generatedAt: new Date(aiAnalysisCache.at).toISOString(), cached: false });
+  } catch (e) {
+    console.error('[AI Analytics] error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
+  }
 });
 
 // ── Price keeper (runs in-process every 60s) ──────────────────
