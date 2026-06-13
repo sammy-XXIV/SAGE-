@@ -1858,6 +1858,42 @@ app.get('/prices', async (req, res) => {
   res.json(result);
 });
 
+// ── DEX analytics (public, for the frontend analytics page) ───────────
+app.get('/analytics', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
+  const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
+  let totalTvl = 0;
+  const pairs = [];
+  await Promise.all(syms.map(async sym => {
+    try {
+      const pairAddr = DEP_PAIRS[sym];
+      const pair = new ethers.Contract(pairAddr, PAIR_ABI_PRICE, provider);
+      const [r0, r1] = await pair.getReserves();
+      const token0  = await pair.token0();
+      const isUsdg0 = token0.toLowerCase() === TOKENS.USDG.address.toLowerCase();
+      const rUSDG  = parseFloat(ethers.formatUnits(isUsdg0 ? r0 : r1, 6));
+      const rSTOCK = parseFloat(ethers.formatUnits(isUsdg0 ? r1 : r0, 18));
+      const price  = rSTOCK > 0 ? rUSDG / rSTOCK : 0;
+      const pd     = await getStockPrice(sym); // for 24h change vs market
+      const poolTvl = rUSDG * 2; // USDG-denominated pool; TVL ≈ 2× USDG reserve
+      totalTvl += poolTvl;
+      pairs.push({ symbol: sym, price, change: pd?.change ?? '0.00', usdgReserve: rUSDG, stockReserve: rSTOCK, tvl: poolTvl, pair: pairAddr });
+    } catch (e) {
+      pairs.push({ symbol: sym, error: true });
+    }
+  }));
+  pairs.sort((a, b) => syms.indexOf(a.symbol) - syms.indexOf(b.symbol));
+  res.json({
+    ok: true,
+    totalTvl,
+    pairCount: pairs.filter(p => !p.error).length,
+    router: DEX?.router || null,
+    oracle: SAGE_ORACLE_ADDRESS,
+    pairs,
+    updatedAt: new Date().toISOString(),
+  });
+});
+
 // ── Price keeper (runs in-process every 60s) ──────────────────
 const KEEPER_THRESHOLD = 0.001; // 0.1% — keep DEX tight enough for limit order triggers
 const KEEPER_PK = process.env.DEPLOYER_PRIVATE_KEY;
