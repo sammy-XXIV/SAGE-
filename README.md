@@ -165,27 +165,10 @@ Hardened across two audits (see commit history):
 
 ## Running locally
 
-1. Add env vars to `.env` (see below)
+1. Configure your `.env` (API keys, RPC, encryption/admin keys, deployer key)
 2. `npm install`
 3. `npm start` — starts the WhatsApp bot + Express API + in-process price keeper
 4. Open `/qr?key=<ADMIN_KEY>` and scan with WhatsApp linked devices
-
-### Required env vars
-
-```
-ANTHROPIC_API_KEY=
-SUPABASE_URL=
-SUPABASE_KEY=
-ENCRYPTION_KEY=          # wallet encryption — required, no fallback
-ADMIN_KEY=               # admin endpoint auth (separate from ENCRYPTION_KEY)
-RPC_URL=
-DEPLOYER_PRIVATE_KEY=    # gas sponsor + price keeper
-FINNHUB_API_KEY=
-SAGE_ACCOUNT_FACTORY=    # defaults to the deployed factory
-SAGE_ORACLE=             # defaults to the deployed oracle
-FRONTEND_BASE=           # base URL for the secure page (defaults to the GitHub Pages site)
-PORT=
-```
 
 ---
 
