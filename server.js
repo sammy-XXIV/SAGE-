@@ -1885,10 +1885,42 @@ async function gatherAnalytics() {
   return { totalTvl, pairCount: pairs.filter(p => !p.error).length, pairs };
 }
 
+// Strip markdown so model output renders clean as plain text
+function stripMd(t) {
+  if (!t) return t;
+  return t.replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1')
+          .replace(/`(.+?)`/g, '$1').replace(/^#+\s*/gm, '').replace(/^\s*[-*]\s+/gm, '').trim();
+}
+
 app.get('/analytics', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
   const a = await gatherAnalytics();
   res.json({ ok: true, ...a, router: DEX?.router || null, oracle: SAGE_ORACLE_ADDRESS, updatedAt: new Date().toISOString() });
+});
+
+// SAGE Copilot — answer market questions grounded in live pool data. Read-only,
+// rate-limited (AI calls cost money; no wallet/trading here so no abuse of funds).
+const askLimiter = rateLimit({ windowMs: 60_000, max: 15, standardHeaders: true, legacyHeaders: false });
+app.options('/analytics/ask', (req, res) => { claimCors(res); res.status(204).end(); });
+app.post('/analytics/ask', askLimiter, async (req, res) => {
+  claimCors(res);
+  const q = (req.body?.question || '').toString().slice(0, 500).trim();
+  if (!q) return res.status(400).json({ ok: false, error: 'Ask a question.' });
+  try {
+    const a = await gatherAnalytics();
+    const data = a.pairs.filter(p => !p.error).map(p => ({ sym: p.symbol, price: +p.price.toFixed(2), change24h: p.change + '%', usdgLiquidity: Math.round(p.usdgReserve), tvl: Math.round(p.tvl) }));
+    const r = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 350,
+      system: 'You are SAGE Copilot, a sharp DeFi market analyst for a tokenized-stock DEX (TSLA, AMZN, NFLX, PLTR, AMD traded vs USDG) on Robinhood Chain. Answer the user\'s question using the live pool data provided. Be concise, direct, and specific with numbers. You may give trading opinions. If the data can\'t answer it, say so briefly. PLAIN TEXT ONLY — no markdown, asterisks, bold, bullets, or headers. Keep it to 2-4 sentences.',
+      messages: [{ role: 'user', content: `Live DEX data — Total TVL $${Math.round(a.totalTvl)}, pools: ${JSON.stringify(data)}\n\nQuestion: ${q}` }],
+    });
+    const answer = stripMd(r.content.find(b => b.type === 'text')?.text?.trim()) || 'I couldn\'t analyze that right now — try again.';
+    res.json({ ok: true, answer });
+  } catch (e) {
+    console.error('[Copilot] error:', e.message);
+    res.status(500).json({ ok: false, error: 'Something went wrong — try again.' });
+  }
 });
 
 // AI market read — SAGE analyzes the live pool data. Cached so page loads don't spam the model.
@@ -1914,16 +1946,7 @@ app.get('/analytics/ai', async (req, res) => {
     } catch (e) {
       console.error('[AI Analytics] model error:', e.message);
     }
-    // Strip markdown so it renders clean as plain text on the page
-    if (analysis) {
-      analysis = analysis
-        .replace(/\*\*(.+?)\*\*/g, '$1')   // bold
-        .replace(/\*(.+?)\*/g, '$1')       // italics
-        .replace(/`(.+?)`/g, '$1')         // code
-        .replace(/^#+\s*/gm, '')           // headers
-        .replace(/^\s*[-*]\s+/gm, '')      // bullet markers
-        .trim();
-    }
+    analysis = stripMd(analysis);
     if (!analysis) {
       const top = [...data].sort((x, y) => parseFloat(y.change24h) - parseFloat(x.change24h))[0];
       analysis = `Total value locked sits at $${Math.round(a.totalTvl)} across ${a.pairCount} pools. ${top?.sym || 'Markets'} leads at ${top?.change24h || '—'}. Liquidity is healthy and balanced across pairs.`;
