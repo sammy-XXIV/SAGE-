@@ -656,43 +656,55 @@ async function getStockPrice(symbol) {
 const activeWalletRegistry = new Map(); // jid -> address
 const lastSeenBlock = new Map();        // address -> blockNumber
 
+// DEX-internal senders — swap outputs come from the pairs/router; those aren't
+// "deposits", so don't alert on them (otherwise every buy would ping the user).
+const INTERNAL_SENDERS = new Set([
+  ...Object.values(DEP_PAIRS).map(a => a.toLowerCase()),
+  ...(DEX?.router ? [DEX.router.toLowerCase()] : []),
+]);
+
 async function monitorIncomingTransfers() {
   if (!activeWalletRegistry.size || !waConnected) return;
 
-  for (const [jid, address] of activeWalletRegistry) {
+  for (const [jid, eoa] of activeWalletRegistry) {
     try {
+      // Deposits go to the smart account; also watch the EOA for legacy/edge cases.
+      const acct = await getAccountAddress(jid);
+      const watch = acct ? [acct.toLowerCase(), eoa.toLowerCase()] : [eoa.toLowerCase()];
       const currentBlock = await provider.getBlockNumber();
-      const fromBlock    = lastSeenBlock.get(address) || currentBlock - 5;
-      lastSeenBlock.set(address, currentBlock);
 
-      if (fromBlock >= currentBlock) continue;
+      for (const address of watch) {
+        const fromBlock = lastSeenBlock.get(address) || currentBlock - 5;
+        lastSeenBlock.set(address, currentBlock);
+        if (fromBlock >= currentBlock) continue;
 
-      // Check ETH transfers via block logs — simpler: check balance change
-      // For ERC-20s, scan Transfer events to this address
-      for (const [symbol, info] of Object.entries(TOKENS)) {
-        if (info.address === 'native') continue;
-        try {
-          const contract = new ethers.Contract(info.address, [
-            'event Transfer(address indexed from, address indexed to, uint256 value)',
-          ], provider);
-          const events = await contract.queryFilter(
-            contract.filters.Transfer(null, address),
-            fromBlock,
-            currentBlock
-          );
-          for (const ev of events) {
-            const amt = parseFloat(ethers.formatUnits(ev.args.value, TOKENS[symbol].decimals));
-            if (amt <= 0) continue;
-            const from = ev.args.from.slice(0, 6) + '...' + ev.args.from.slice(-4);
-            await sendWAMessage(jid,
-              `💰 *Incoming Transfer*\n\n` +
-              `+${amt.toFixed(4)} ${symbol}\n` +
-              `From: ${from}\n` +
-              `Tx: ${ev.transactionHash.slice(0, 10)}...\n` +
-              `https://explorer.testnet.chain.robinhood.com/tx/${ev.transactionHash}`
+        for (const [symbol, info] of Object.entries(TOKENS)) {
+          if (info.address === 'native') continue;
+          try {
+            const contract = new ethers.Contract(info.address, [
+              'event Transfer(address indexed from, address indexed to, uint256 value)',
+            ], provider);
+            const events = await contract.queryFilter(
+              contract.filters.Transfer(null, address),
+              fromBlock,
+              currentBlock
             );
-          }
-        } catch {}
+            for (const ev of events) {
+              const fromAddr = ev.args.from.toLowerCase();
+              if (INTERNAL_SENDERS.has(fromAddr) || fromAddr === address) continue; // skip swap outputs / self
+              const amt = parseFloat(ethers.formatUnits(ev.args.value, TOKENS[symbol].decimals));
+              if (amt <= 0) continue;
+              const from = ev.args.from.slice(0, 6) + '...' + ev.args.from.slice(-4);
+              await sendWAMessage(jid,
+                `💰 *Incoming Transfer*\n\n` +
+                `+${amt.toFixed(4)} ${symbol}\n` +
+                `From: ${from}\n` +
+                `Tx: ${ev.transactionHash.slice(0, 10)}...\n` +
+                `https://explorer.testnet.chain.robinhood.com/tx/${ev.transactionHash}`
+              );
+            }
+          } catch {}
+        }
       }
     } catch {}
   }
