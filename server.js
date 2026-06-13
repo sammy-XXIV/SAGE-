@@ -108,7 +108,10 @@ const SAGE_ACCOUNT_ABI = [
   'function sessionKey() view returns (address)',
   'function remainingToday() view returns (uint256)',
 ];
-function userIdFor(jid) { return ethers.keccak256(ethers.toUtf8Bytes(jid)); }
+// Key accounts by jid + the wallet's EOA. A fresh wallet (e.g. after a reset)
+// gets a brand-new on-chain account instead of reusing a stale one owned by a
+// now-deleted key.
+function userIdFor(jid, eoa) { return ethers.keccak256(ethers.toUtf8Bytes(eoa ? `${jid}:${eoa.toLowerCase()}` : jid)); }
 
 // ── Secure web link (self-custody / password / export, off-chat) ──────
 // The user sets a password and a key is generated in their BROWSER on this
@@ -280,7 +283,7 @@ async function ensureAccount(jid, eoaAddress) {
   try {
     const deployer = new ethers.Wallet(KEEPER_PK, provider);
     const factory  = new ethers.Contract(SAGE_ACCOUNT_FACTORY, ACCOUNT_FACTORY_ABI, deployer);
-    const userId   = userIdFor(jid);
+    const userId   = userIdFor(jid, eoaAddress);
 
     // May already exist on-chain (e.g. DB column added after creation)
     let acct = await factory.accountOf(userId);
@@ -1332,7 +1335,7 @@ LANGUAGE:
 - Always reply in the SAME language the user writes to you in (English, French, Yoruba, Spanish, Pidgin, Swahili, Arabic, etc.). If they switch languages, switch with them. Keep ticker symbols and addresses as-is.
 
 Formatting rules (WhatsApp):
-- Use *bold* only on the single most important value per message
+- PLAIN TEXT ONLY. Never use asterisks (*), bold, italics, or any markdown. No * characters at all.
 - No markdown headers (#, ##) — use plain text structure
 - Keep responses short — 3-5 lines max unless analysis is requested
 
@@ -1561,7 +1564,7 @@ const pendingImages = new Map();
 
 async function sendWAMessage(jid, text) {
   if (!waSocket || !waConnected) return;
-  await waSocket.sendMessage(jid, { text });
+  await waSocket.sendMessage(jid, { text: String(text).replace(/\*/g, '') }); // no asterisks/markdown
 }
 
 async function connectWhatsApp() {
@@ -1699,7 +1702,7 @@ async function connectWhatsApp() {
           continue;
         }
 
-        await waSocket.sendMessage(jid, { text: reply });
+        await waSocket.sendMessage(jid, { text: String(reply).replace(/\*/g, '') }); // no asterisks/markdown
       } catch (e) {
         console.error('Message handler error:', e.message);
         await waSocket.sendMessage(jid, { text: 'Something went wrong. Try again.' });
