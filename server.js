@@ -141,6 +141,23 @@ async function setKeystore(jid, keystore) {
   await supabase.from('rh_wallets').update({ password_hash: keystore }).eq('jid', jid);
 }
 
+// "Secured" = the user has taken self-custody: a password-encrypted keystore exists,
+// or the account owner is no longer SAGE's session key (claimed to their own wallet).
+async function isSecured(jid, eoaAddr) {
+  if (await getKeystore(jid)) return true;
+  try {
+    const acct = await getAccountAddress(jid);
+    if (!acct) return false;
+    const owner = await new ethers.Contract(acct, SAGE_ACCOUNT_ABI, provider).owner();
+    return owner.toLowerCase() !== eoaAddr.toLowerCase();
+  } catch { return false; }
+}
+
+function securePrompt(jid) {
+  const link = `${FRONTEND_BASE}/secure.html?t=${makeSecureToken(jid)}`;
+  return `🔐 Secure your wallet first — set your password so only you control your funds. Takes 10 seconds:\n${link}\n\nMessage me once you're done and we're off 🚀`;
+}
+
 // ── Encryption ─────────────────────────────────────────────────
 // v2 format:           v2:salt:iv:tag:ct   — AES-256-GCM, random per-secret salt (authenticated)
 // legacy CBC random:   salt:iv:ct          (3 parts)
@@ -1386,13 +1403,15 @@ UNSUPPORTED REQUESTS:
 
 // ── Claude message handler ────────────────────────────────────
 async function handleMessage(jid, text) {
-  const state = onboardingState.get(jid);
+  let state = onboardingState.get(jid);
 
   // ── Onboarding: first ever message — auto-create wallet + smart account, no password ──
   if (!state) {
     const { data } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
     if (data) {
-      onboardingState.set(jid, 'done'); // returning user — skip onboarding
+      // Returning user — must be secured to proceed
+      state = (await isSecured(jid, data.address)) ? 'done' : 'awaiting_secure';
+      onboardingState.set(jid, state);
     } else {
       // One message, zero decisions, no chat-typed secrets: create the wallet,
       // provision the on-chain smart account (SAGE pays the gas), hand back the address.
@@ -1400,12 +1419,22 @@ async function handleMessage(jid, text) {
       const encrypted_pk = encrypt(wallet.privateKey);
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
-      onboardingState.set(jid, 'done');
+      onboardingState.set(jid, 'awaiting_secure');
       const account = await ensureAccount(jid, wallet.address);
       const addr = account || wallet.address;
       const setupLink = `${FRONTEND_BASE}/secure.html?t=${makeSecureToken(jid)}`;
-      return `👋 Welcome to *SAGE* — your on-chain wallet is ready. No app, no gas, no crypto experience needed. ⚡\n\n🔐 *Secure it now — do this first.* Set your password so only YOU can ever withdraw. Takes 10 seconds:\n${setupLink}\n\n(Until you do, your funds are safe but SAGE holds the keys. Setting a password makes it truly yours.)\n\n📥 Then deposit USDG here to trade:\n\`${addr}\`\n\nor just say *"buy $10 of TSLA"* / *"show my portfolio"*.`;
+      return `👋 Welcome to *SAGE* — your on-chain wallet is ready. No app, no gas, no crypto experience needed. ⚡\n\n🔐 *Set your password to start — this secures your wallet so only YOU can ever withdraw.* Takes 10 seconds:\n${setupLink}\n\nYou'll need to do this before trading. Once done, message me and we're off 🚀`;
     }
+  }
+
+  // ── Hard gate: cannot proceed until the wallet is secured ────
+  if (state === 'awaiting_secure') {
+    const { data: row } = await supabase.from('rh_wallets').select('address, account_address').eq('jid', jid).single();
+    if (row && await isSecured(jid, row.address)) {
+      onboardingState.set(jid, 'done');
+      return `✅ *Wallet secured — it's all yours now.*\n\nDeposit USDG to:\n\`${row.account_address || row.address}\`\n\nThen say *"buy $10 of TSLA"* or *"show my portfolio"* 🚀`;
+    }
+    return securePrompt(jid);
   }
 
   // ── Normal AI flow (onboarding done) ─────────────────────────
