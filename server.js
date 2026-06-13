@@ -1847,6 +1847,25 @@ app.post('/vault/get', async (req, res) => {
   }
 });
 
+// Sponsor the owner's gas so it can sign a withdrawal in-browser (no key export).
+// The owner key (browser-generated) starts with 0 ETH; SAGE tops it up.
+app.options('/vault/sponsor', (req, res) => { claimCors(res); res.status(204).end(); });
+app.post('/vault/sponsor', async (req, res) => {
+  claimCors(res);
+  const t = peekSecureToken(req.body?.token);
+  if (!t) return res.status(404).json({ ok: false, error: 'Link invalid or expired.' });
+  try {
+    const account = await getAccountAddress(t.jid);
+    if (!account) return res.status(409).json({ ok: false, error: 'No account.' });
+    const owner = await new ethers.Contract(account, SAGE_ACCOUNT_ABI, provider).owner();
+    await sponsorGas(owner); // tops up only if below threshold
+    res.json({ ok: true, account, owner });
+  } catch (e) {
+    console.error('[Vault] sponsor error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
+  }
+});
+
 app.get('/prices', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
   const syms = ['TSLA', 'AMZN', 'NFLX', 'PLTR', 'AMD'];
