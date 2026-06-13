@@ -110,6 +110,25 @@ const SAGE_ACCOUNT_ABI = [
 ];
 function userIdFor(jid) { return ethers.keccak256(ethers.toUtf8Bytes(jid)); }
 
+// ── Secure web link (self-custody / password / export, off-chat) ──────
+// The user sets a password and a key is generated in their BROWSER on this
+// page — nothing secret ever travels through chat or reaches the server.
+// The page sends back only the public address, which becomes the account owner.
+const FRONTEND_BASE = process.env.FRONTEND_BASE || 'https://sammy-xxiv.github.io/sage';
+const SECURE_TOKEN_TTL = 60 * 60 * 1000; // 1 hour
+const secureTokens = new Map(); // token -> { jid, expires }
+
+function makeSecureToken(jid) {
+  const token = crypto.randomBytes(24).toString('hex');
+  secureTokens.set(token, { jid, expires: Date.now() + SECURE_TOKEN_TTL });
+  return token;
+}
+function peekSecureToken(token) {
+  const t = secureTokens.get(token);
+  if (!t || Date.now() > t.expires) { secureTokens.delete(token); return null; }
+  return t;
+}
+
 // ── Encryption ─────────────────────────────────────────────────
 // v2 format:           v2:salt:iv:tag:ct   — AES-256-GCM, random per-secret salt (authenticated)
 // legacy CBC random:   salt:iv:ct          (3 parts)
@@ -830,6 +849,11 @@ const sageTools = [
       required: ['new_owner'],
     },
   },
+  {
+    name: 'get_secure_link',
+    description: 'Generate a one-time secure web link where the user sets a password and takes full self-custody of their wallet — a key is generated in their own browser, never seen by SAGE and never typed in chat. Use this whenever the user wants to: set a password, secure their wallet, take full control/ownership, go self-custodial, export their key, or withdraw to their own control. No wallet/MetaMask required.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────
@@ -1215,6 +1239,19 @@ async function executeTool(name, input, jid) {
       };
     }
 
+    if (name === 'get_secure_link') {
+      const row = await getOrCreateWallet(jid);
+      let accountAddr = await getAccountAddress(jid);
+      if (!accountAddr) accountAddr = await ensureAccount(jid, row.address);
+      if (!accountAddr) return { error: 'Your smart account isn\'t ready yet — try again in a moment.' };
+      const token = makeSecureToken(jid);
+      const url = `${FRONTEND_BASE}/secure.html?t=${token}`;
+      return {
+        url,
+        message: `🔐 Open this private link to set a password and take full control of your wallet:\n${url}\n\nYour password and key are created in your browser — I never see them. The link works once and expires in 1 hour.`,
+      };
+    }
+
     return { error: 'Unknown tool' };
   } catch (e) {
     console.error(`Tool error [${name}]:`, e.message);
@@ -1322,9 +1359,11 @@ FAUCET:
 - When user asks for testnet ETH, gas, or faucet: call get_faucet
 - Display their address and the faucet URL clearly
 
-FULL CONTROL / PRIVATE KEY:
-- Raw private-key export over chat is not supported — putting a key in a chat isn't safe.
-- If the user wants their key, their funds "in their own wallet", or full control, guide them to claim self-custody: tell them to say "claim my wallet" and provide an address they own (see SELF-CUSTODY). That moves ownership on-chain with no secret ever typed in chat. A secure key-export page is on the roadmap.
+FULL CONTROL / PASSWORD / PRIVATE KEY / WITHDRAW TO SELF:
+- SAGE never handles passwords or private keys in chat — they'd sit in chat history.
+- Whenever the user wants to: set a password, secure their wallet, take full control/ownership, go self-custodial, export their key, or withdraw to their own control — call get_secure_link and send them the one-time link.
+- On that page they set a password and a key is generated in their own browser; SAGE never sees it. No MetaMask needed. Tell them: the link works once, expires in 1 hour, and forgetting the password means losing access (same as any self-custodial wallet).
+- (Power users who already have a wallet can instead just provide their own address and you can use claim_ownership directly.)
 
 UNSUPPORTED REQUESTS:
 - Never make up features, apps, or systems that don't exist
@@ -1713,6 +1752,62 @@ app.get('/admin/reset-user', async (req, res) => {
     res.json({ ok: true, jid, message: 'User reset — next message restarts onboarding.' });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Secure self-custody page endpoints (token-gated, CORS to the frontend) ──
+function claimCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', 'https://sammy-xxiv.github.io');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+app.options('/claim/info', (req, res) => { claimCors(res); res.status(204).end(); });
+app.options('/claim/complete', (req, res) => { claimCors(res); res.status(204).end(); });
+
+// Validate a token and return the account to be claimed (no jid exposed).
+app.get('/claim/info', async (req, res) => {
+  claimCors(res);
+  const t = peekSecureToken(req.query.token);
+  if (!t) return res.status(404).json({ ok: false, error: 'This link is invalid or has expired. Ask SAGE for a new one.' });
+  try {
+    const account = await getAccountAddress(t.jid);
+    if (!account) return res.status(409).json({ ok: false, error: 'No smart account found.' });
+    const owner = await new ethers.Contract(account, SAGE_ACCOUNT_ABI, provider).owner();
+    res.json({ ok: true, account, alreadyClaimed: owner.toLowerCase() !== activeWalletRegistry.get(t.jid)?.toLowerCase() });
+  } catch (e) {
+    console.error('[Claim] info error:', e.message);
+    res.status(500).json({ ok: false, error: 'internal error' });
+  }
+});
+
+// Complete the claim: page submits the browser-generated public address; the
+// server transfers ownership to it (signed by SAGE's session key, gas sponsored).
+app.post('/claim/complete', async (req, res) => {
+  claimCors(res);
+  const { token, owner } = req.body || {};
+  const t = peekSecureToken(token);
+  if (!t) return res.status(404).json({ ok: false, error: 'Link invalid or expired.' });
+  if (!ethers.isAddress(owner)) return res.status(400).json({ ok: false, error: 'Bad owner address.' });
+  try {
+    const accountAddr = await getAccountAddress(t.jid);
+    if (!accountAddr) return res.status(409).json({ ok: false, error: 'No smart account.' });
+    const signer = await getSignerForJid(t.jid);
+    await sponsorGas(signer.address);
+    const account = new ethers.Contract(accountAddr, SAGE_ACCOUNT_ABI, signer);
+    const currentOwner = await account.owner();
+    if (currentOwner.toLowerCase() !== signer.address.toLowerCase()) {
+      secureTokens.delete(token);
+      return res.status(409).json({ ok: false, error: 'This wallet is already self-custodied.' });
+    }
+    const tx = await account.transferOwnership(owner);
+    await waitTx(tx);
+    secureTokens.delete(token); // one-time use
+    // Let the user know in WhatsApp too
+    sendWAMessage(t.jid, `✅ *Self-custody activated.*\nYour wallet is now owned by \`${owner}\`. I can still trade for you, but only your key can withdraw — not even SAGE. Keep your downloaded key file safe.`).catch(() => {});
+    res.json({ ok: true, account: accountAddr, owner, hash: tx.hash, explorer: `https://explorer.testnet.chain.robinhood.com/tx/${tx.hash}` });
+  } catch (e) {
+    console.error('[Claim] complete error:', e.message);
+    res.status(500).json({ ok: false, error: 'Transfer failed — try the link again.' });
   }
 });
 
