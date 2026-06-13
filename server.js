@@ -1322,12 +1322,11 @@ FAUCET:
 - When user asks for testnet ETH, gas, or faucet: call get_faucet
 - Display their address and the faucet URL clearly
 
-EXPORTING PRIVATE KEY:
-- If the user asks to export or see their private key, reply EXACTLY with: __TRIGGER_EXPORT__
-- Do not say anything else, do not explain — just that token
+FULL CONTROL / PRIVATE KEY:
+- Raw private-key export over chat is not supported — putting a key in a chat isn't safe.
+- If the user wants their key, their funds "in their own wallet", or full control, guide them to claim self-custody: tell them to say "claim my wallet" and provide an address they own (see SELF-CUSTODY). That moves ownership on-chain with no secret ever typed in chat. A secure key-export page is on the roadmap.
 
 UNSUPPORTED REQUESTS:
-- If the user asks to change their password, say: "Password change isn't supported yet. If you need to reset it, export your private key and reimport your wallet."
 - Never make up features, apps, or systems that don't exist
 - If you can't do something, say so directly in one line`;
 
@@ -1335,71 +1334,23 @@ UNSUPPORTED REQUESTS:
 async function handleMessage(jid, text) {
   const state = onboardingState.get(jid);
 
-  // ── Onboarding: first ever message — auto-create wallet, single path ──
+  // ── Onboarding: first ever message — auto-create wallet + smart account, no password ──
   if (!state) {
     const { data } = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
     if (data) {
       onboardingState.set(jid, 'done'); // returning user — skip onboarding
     } else {
-      // One path, zero decisions: silently create the wallet, then ask for a password.
+      // One message, zero decisions, no chat-typed secrets: create the wallet,
+      // provision the on-chain smart account (SAGE pays the gas), hand back the address.
       const wallet = ethers.Wallet.createRandom();
       const encrypted_pk = encrypt(wallet.privateKey);
       await supabase.from('rh_wallets').upsert({ jid, address: wallet.address, encrypted_pk });
       activeWalletRegistry.set(jid, wallet.address);
-      onboardingState.set(jid, 'awaiting_password_set');
-      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed — I've just created a secure on-chain wallet for you. ⚡\n\nSet a *password* to protect it (you'll need it to export your key later).\n\nReply with your chosen password:`;
-    }
-  }
-
-  // ── Onboarding: set password ──────────────────────────────────
-  if (state === 'awaiting_password_set') {
-    const password = text.trim();
-    if (password.length < 6) return `❌ Password too short. Use at least 6 characters.`;
-    const pwSalt = crypto.randomBytes(16).toString('hex');
-    const pwKey  = crypto.scryptSync(password, pwSalt, 32).toString('hex');
-    const password_hash = `scrypt:${pwSalt}:${pwKey}`;
-    await supabase.from('rh_wallets').update({ password_hash }).eq('jid', jid);
-    onboardingState.set(jid, 'done');
-
-    // Provision the on-chain smart account (gas paid by SAGE, not the user)
-    const row = await supabase.from('rh_wallets').select('address').eq('jid', jid).single();
-    const eoa = row.data?.address;
-    const account = eoa ? await ensureAccount(jid, eoa) : null;
-
-    if (account) {
-      return `🔒 *Password set!*\n\nYou've got a *smart account* — an on-chain wallet where even SAGE can't move your funds out without your key. And SAGE covers all gas fees, so you never need ETH. ⚡\n\n📥 *Your wallet — deposit USDG & stocks here:*\n\`${account}\`\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to start 🚀`;
-    }
-    return `🔒 *Password set!*\n\nYour wallet is ready. To trade, just deposit USDG — SAGE covers all gas.\n\nSay *"what's my wallet"* to get your address, or *"show my portfolio"* to start 🚀`;
-  }
-
-  // ── Export private key: waiting for password ──────────────────
-  if (state === 'awaiting_export_password') {
-    exportIntentJids.delete(jid); // consume the grant — no stale standing approvals
-    const { data: row } = await supabase.from('rh_wallets').select('encrypted_pk, password_hash').eq('jid', jid).single();
-    let passwordMatch = false;
-    if (row.password_hash?.startsWith('scrypt:')) {
-      const [, saltHex, storedKey] = row.password_hash.split(':');
-      passwordMatch = crypto.scryptSync(text.trim(), saltHex, 32).toString('hex') === storedKey;
-    } else {
-      // Legacy SHA256 — still works for existing users
-      passwordMatch = crypto.createHash('sha256').update(text.trim()).digest('hex') === row.password_hash;
-    }
-    if (!passwordMatch) {
       onboardingState.set(jid, 'done');
-      return `❌ Wrong password. Export cancelled.`;
+      const account = await ensureAccount(jid, wallet.address);
+      const addr = account || wallet.address;
+      return `👋 Welcome to *SAGE* — trade tokenized stocks (TSLA, AMZN, PLTR, NFLX, AMD) right from WhatsApp.\n\nNo app, no gas, no crypto experience needed. I've set up your on-chain wallet and I cover all the gas. ⚡\n\n📥 *Your wallet — deposit USDG here to start:*\n\`${addr}\`\n\nSay *"buy $10 of TSLA"* or *"show my portfolio"* to begin 🚀\n\nWant full control of your funds anytime? Just say *"claim my wallet"*.`;
     }
-    const pk = decrypt(row.encrypted_pk);
-    onboardingState.set(jid, 'done');
-    // Return special marker — message handler will send + schedule deletion
-    return `__EXPORT_PK__${pk}`;
-  }
-
-  // ── Export private key: detect intent server-side (before Claude) ────
-  const EXPORT_RE = /\b(export|show|give me|reveal|display|get)\b.{0,30}\b(private\s?key|pk)\b/i;
-  if (EXPORT_RE.test(text)) {
-    exportIntentJids.add(jid);
-    onboardingState.set(jid, 'awaiting_export_password');
-    return `🔒 Enter your *password* to export your private key:`;
   }
 
   // ── Normal AI flow (onboarding done) ─────────────────────────
