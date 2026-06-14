@@ -12,7 +12,7 @@ Built for the **Arbitrum Open House London** hackathon.
 
 Most "DeFi on chat" demos are thin wrappers over a custodial hot wallet — one server breach drains everyone. SAGE pushes the trust on-chain:
 
-- 🛡️ **On-chain Risk Guard** — each user's funds live in a `SageAccount` smart contract. SAGE's server key can only *trade* (swap on the SAGE DEX, capped per 24h) — it has no code path to move funds out. A fully compromised server can't drain a single wallet.
+- 🛡️ **On-chain Risk Guard** — each user's funds live in a `SageAccount` smart contract. SAGE's server key can only *trade verified tokens* (swap on the SAGE DEX, capped per 24h) — it has no code path to move funds out or touch an unlisted/scam token. A fully compromised server can't drain a single wallet.
 - 🔑 **Real self-custody, no wallet required** — set a password on a one-time secure web page; a key is generated **in your browser** (SAGE never sees it or the password) and becomes the on-chain owner. After that SAGE keeps trading for you but can never withdraw — only you can. No MetaMask needed, no secret ever typed in chat.
 - ⚡ **Gasless, single address** — SAGE sponsors every transaction. Users never touch a faucet or hold ETH, and deal with one wallet address.
 - 🤖 **AI analytics + copilot** — the DEX analytics page has SAGE generate a live market read and answer free-form questions, grounded in real on-chain pool data.
@@ -107,8 +107,9 @@ Before any swap, SAGE checks (and blocks unless the user overrides):
 - **Price impact** > 8% — pool too thin for the trade size
 - **Concentration** > 25% of portfolio in one trade
 - **Spending limit** — optional per-user max USDG per trade
+- **Verified tokens only** — SAGE trades a fixed allowlist (USDG, TSLA, AMZN, PLTR, NFLX, AMD) and refuses any other token or pasted contract address, so scam/unknown tokens can't be swapped
 
-The 24h trading cap is additionally enforced **on-chain** by the `SageAccount` contract, independent of the server.
+Both the 24h trading cap **and** the verified-token allowlist are additionally enforced **on-chain** by the `SageAccount` contract (`allowedToken`), independent of the server — a compromised server still can't swap an unlisted token.
 
 ---
 

@@ -564,6 +564,20 @@ async function executeSwap(jid, fromSymbol, toSymbol, amountIn, minAmountOut) {
 // ── Stock price lookup (Yahoo Finance unofficial) ──────────────
 const STOCK_SYMBOLS = { TSLA: 'TSLA', AMZN: 'AMZN', PLTR: 'PLTR', NFLX: 'NFLX', AMD: 'AMD' };
 
+// Verified token allowlist — SAGE only ever swaps these. Anything else (random
+// tickers, pasted contract addresses, scam tokens) is refused. Also enforced
+// on-chain by SageAccount.allowedToken.
+const VERIFIED_SWAP_TOKENS = new Set(['USDG', 'TSLA', 'AMZN', 'PLTR', 'NFLX', 'AMD']);
+function verifiedTokenBlock(fromSym, toSym) {
+  const bad = [fromSym, toSym].find(s => !VERIFIED_SWAP_TOKENS.has(String(s || '').toUpperCase()));
+  if (!bad) return null;
+  return {
+    blocked: true,
+    reason: 'unverified_token',
+    message: `🛡️ *SAGE only trades verified tokens.* "${bad}" isn't on the verified list (USDG, TSLA, AMZN, PLTR, NFLX, AMD), so I won't swap it — that's how I protect you from scam and unknown tokens. This is also enforced on-chain by your wallet contract.`,
+  };
+}
+
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
 const DEP_PAIRS = JSON.parse(fs.readFileSync(path.join(__dirname, 'deployment.json'), 'utf8')).pairs;
@@ -982,6 +996,8 @@ async function executeTool(name, input, jid) {
     }
 
     if (name === 'get_swap_quote') {
+      const unverified = verifiedTokenBlock(input.from_symbol, input.to_symbol);
+      if (unverified) return unverified;
       const quote = await getSwapQuote(input.from_symbol, input.to_symbol, input.amount_in);
       return quote;
     }
@@ -990,6 +1006,10 @@ async function executeTool(name, input, jid) {
       const fromSym = input.from_symbol.toUpperCase();
       const toSym   = input.to_symbol.toUpperCase();
       const amtIn   = parseFloat(input.amount_in);
+
+      // Verified-token allowlist — refuse scam/unknown tokens (also enforced on-chain)
+      const unverified = verifiedTokenBlock(fromSym, toSym);
+      if (unverified) return unverified;
 
       // force=true is only honored if a risk guard blocked for this user recently (server-side).
       // This prevents Claude from self-granting force bypass via prompt injection.
@@ -1376,8 +1396,13 @@ TRADING STOCKS:
 - Present the quote clearly: "You'll swap 10 USDG → ~0.04 TSLA. Confirm?"
 - Only call execute_swap after explicit confirmation
 - After swap: show tx hash + explorer link + what they received
-- Swaps go through the SAGE DEX — a Uniswap V2 AMM deployed on Robinhood Chain
+- Swaps go through the SAGE DEX — a Uniswap V2-style AMM deployed on Robinhood Chain
 - Supported pairs: USDG/TSLA, USDG/AMZN, USDG/PLTR, USDG/NFLX, USDG/AMD
+
+VERIFIED TOKENS ONLY:
+- SAGE only trades a verified allowlist: USDG, TSLA, AMZN, PLTR, NFLX, AMD.
+- If the user asks to buy/sell/swap ANY other token, ticker, or a pasted contract address, REFUSE clearly and never attempt it. Say something like: "I only trade verified tokens — that one isn't on the list, so I won't swap it. It's how I protect you from scam tokens." This is also enforced on-chain.
+- Never invent or trade a token outside the verified list.
 
 PRICE ALERTS:
 - When user says "alert me when TSLA hits $X" or similar: call set_price_alert
