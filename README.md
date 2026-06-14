@@ -140,11 +140,11 @@ Hardened across two audits (see commit history):
 
 ## Stack
 
-- **WhatsApp**: [@whiskeysockets/baileys](https://github.com/WhiskeySockets/Baileys) — linked-device protocol, auth persisted (encrypted) in Supabase
+- **WhatsApp**: Baileys for the demo, with a path to the official WhatsApp Business Cloud API for production; session auth persisted (encrypted) in Supabase
 - **AI**: Claude `claude-haiku-4-5` with tool use (`get_portfolio`, `execute_swap`, `get_secure_link`, `claim_ownership`, `set_limit_order`, …) — also powers the analytics market read and the "Ask SAGE" copilot
 - **Chain**: ethers.js v6
 - **Smart accounts**: `SageAccount` + `SageAccountFactory` — per-user on-chain wallets with the Risk Guard enforced in Solidity
-- **DEX**: SageDEX — custom Uniswap V2 fork (`SageFactory`, `SagePair` with TWAP, `SageRouter`)
+- **DEX**: SageDEX — our own AMM (`SageFactory`, `SagePair` with TWAP, `SageRouter`), built on the battle-tested Uniswap V2 model
 - **Oracle**: `SageOracle` — on-chain spot + TWAP price feed
 - **Backend**: Express on Railway
 - **Frontend**: static DEX UI, AI analytics page, and client-side secure self-custody page on GitHub Pages
